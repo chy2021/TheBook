@@ -1,0 +1,17 @@
+
+
+一、测试链配置
+1、MetaMask自动添加节点
+Conflux Espace节点，可从这里直接添加到metamask
+https://chainlist.org/
+
+2、前端后端手动添加节点
+名称：     Conflux eSpace
+RPC：      https://evm.confluxrpc.com
+链id:      1030
+区块浏览器 https://evm.confluxscan.net
+
+3、测试账户
+MetaMask直接申请即可。
+
+二、合约接口
