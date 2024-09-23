@@ -93,6 +93,9 @@ contract TheBook is ERC721A{
     address private minter;
     // Token baseURI
     string private baseURI;
+
+    // The maximum NFTs that can be minted.
+    uint256 private constant _MAX_NFT_SUPPLY = 290109;
     
     // =============================================================
     //                          CONSTRUCTOR
@@ -107,6 +110,9 @@ contract TheBook is ERC721A{
     //                              MINT
     // ============================================================= 
     function mint(address to, uint256 quantity) external onlyMinter(){
+        require(totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum supply exceeded.");
+        require(quantity + totalSupply() < _MAX_NFT_SUPPLY), "Limitation: Maximum quantity exceeded.";
+
         _mint(to, quantity);
     }
 
