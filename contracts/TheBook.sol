@@ -1,22 +1,26 @@
+// SPDX-License-Identifier: MIT
+//Contract based on [https://docs.openzeppelin.com/contracts/3.x/erc721](https://docs.openzeppelin.com/contracts/3.x/erc721)
+//Contract based on [ERC721A](https://www.erc721a.org/)
+
 pragma solidity ^0.8.4;
 
 import './ERC721A.sol';
 
 /**
  * @title TheBook
- *
- * @dev USE [ERC721A](https://www.erc721a.org/)
- *
  */
 contract TheBook is ERC721A{
-    address private _minter;
+    // Token minter
+    address private minter;
+    // Token baseURI
+    string private baseURI;
     
     // =============================================================
     //                          CONSTRUCTOR
     // =============================================================
-    constructor(string memory name_, string memory symbol_) ERC721A(name_, symbol_){
+    constructor() ERC721A("TheBook", "TB"){
         address msgSender = _msgSenderERC721A();
-        _minter = msgSender;
+        minter = msgSender;
         emit mintershipTransferred(address(0), msgSender);
     }
 
@@ -28,21 +32,45 @@ contract TheBook is ERC721A{
     }
 
     // =============================================================
+    //                              BaseURI
+    // ============================================================= 
+    function _baseURI() internal view virtual override returns (string memory) {
+        return baseURI;
+    }
+
+    function setBaseURI(string memory _baseURI) external onlyMinter(){
+        baseURI = _baseURI;
+    }
+
+    // =============================================================    
+    //                              WithDraw
+    // ============================================================= 
+    function withdraw() public onlyMinter {
+        uint256 balance = address(this).balance;
+        payable(msg.sender).transfer(balance);
+    }
+
+    function withdrawTokens(IERC20 token) public onlyMinter {
+        uint256 balance = token.balanceOf(address(this));
+        token.transfer(msg.sender, balance);
+    }
+
+    // =============================================================
     //                     MINTERSHIPS OPERATIONS
     // =============================================================
     
     /**
      * @dev Returns the address of the current minter.
      */
-    function minter() public view returns (address) {
-        return _minter;
+    function getMinter() public view returns (address) {
+        return minter;
     }
 
     /**
      * @dev Throws if called by any account other than the minter.
      */
     modifier onlyMinter() {
-        require(_minter == _msgSenderERC721A(), "Minterable: caller is not the minter.");
+        require(minter == _msgSenderERC721A(), "Minterable: caller is not the minter.");
         _;
     }
 
@@ -54,8 +82,8 @@ contract TheBook is ERC721A{
      * thereby removing any functionality that is only available to the minter.
      */
     function renouncemintership() public onlyMinter {
-        emit mintershipTransferred(_minter, address(0));
-        _minter = address(0);
+        emit mintershipTransferred(minter, address(0));
+        minter = address(0);
     }
 
     /**
@@ -64,8 +92,8 @@ contract TheBook is ERC721A{
      */
     function transfermintership(address newminter) public onlyMinter {
         require(newminter != address(0), "Ownable: new minter is the zero address");
-        emit mintershipTransferred(_minter, newminter);
-        _minter = newminter;
+        emit mintershipTransferred(minter, newminter);
+        minter = newminter;
     }
 
     event mintershipTransferred(address indexed previousminter, address indexed newminter);
@@ -291,6 +319,4 @@ contract TheBook is ERC721A{
             }
         }
     }
-
-
 }
