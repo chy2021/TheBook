@@ -111,7 +111,7 @@ contract TheBook is ERC721A{
     // ============================================================= 
     function mint(address to, uint256 quantity) external onlyMinter(){
         require(totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum supply exceeded.");
-        require(quantity + totalSupply() < _MAX_NFT_SUPPLY), "Limitation: Maximum quantity exceeded.";
+        require(quantity + totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum quantity exceeded.");
 
         _mint(to, quantity);
     }
