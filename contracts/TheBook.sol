@@ -100,7 +100,11 @@ contract TheBook is ERC721A{
     // =============================================================
     //                          CONSTRUCTOR
     // =============================================================
-    constructor() ERC721A("TheBook", "TB"){
+    constructor(
+        string memory name_,
+        string memory symbol_
+    ) ERC721A(name_, symbol_){
+        //set mintership
         address msgSender = _msgSenderERC721A();
         minter = msgSender;
         emit mintershipTransferred(address(0), msgSender);
@@ -109,6 +113,15 @@ contract TheBook is ERC721A{
     // =============================================================
     //                              MINT
     // ============================================================= 
+    
+    /**
+     * @dev Mints a number of 'quantity' NFTs to 'to' address.
+     *
+     * Requirements:
+     *
+     * - `totalSupply < _MAX_NFT_SUPPLY`
+     * - `totalSupply + quantity < _MAX_NFT_SUPPLY`
+     */
     function mint(address to, uint256 quantity) external onlyMinter(){
         require(totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum supply exceeded.");
         require(quantity + totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum quantity exceeded.");
@@ -123,6 +136,9 @@ contract TheBook is ERC721A{
         return baseURI;
     }
 
+    /**
+     * @dev Minter Role can update baseURI.
+     */
     function setBaseURI(string memory uri) external onlyMinter(){
         baseURI = uri;
     }
@@ -130,16 +146,26 @@ contract TheBook is ERC721A{
     // =============================================================    
     //                              WithDraw
     // ============================================================= 
+    
+    /**
+     * @dev Minter Role can withdraw the token accidentally transferred into the contract.
+     */
     function withdraw() external onlyMinter() {
         uint256 balance = address(this).balance;
         payable(msg.sender).transfer(balance);
     }
 
+    /**
+     * @dev Minter Role can withdraw the ERC20 assets accidentally transferred into the contract.
+     */
     function withdrawTokens(IERC20 token) external onlyMinter() {
         uint256 balance = token.balanceOf(address(this));
         token.transfer(msg.sender, balance);
     }
 
+    /**
+     * @dev Minter Role can withdraw the ERC721 assets accidentally transferred into the contract.
+     */
     function withdrawNFT(address nftContractAddress, uint256 tokenId) external onlyMinter() {
         IERC721A(nftContractAddress).safeTransferFrom(address(this), msg.sender, tokenId);
     }
