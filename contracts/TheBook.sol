@@ -132,7 +132,7 @@ contract TheBook is ERC721A{
     // =============================================================
     //                              BaseURI
     // ============================================================= 
-    function _baseURI() internal view virtual override returns (string memory) {
+    function _baseURI() internal view virtual override(ERC721A) returns (string memory) {
         return baseURI;
     }
 
@@ -142,6 +142,17 @@ contract TheBook is ERC721A{
     function setBaseURI(string memory uri) external onlyMinter(){
         baseURI = uri;
     }
+
+    /**
+     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.
+     */
+    function tokenURI(uint256 tokenId) public view virtual override(ERC721A) returns (string memory) {
+        if (!_exists(tokenId)) _revert(URIQueryForNonexistentToken.selector);
+
+        string memory baseURI = _baseURI();
+        return bytes(baseURI).length != 0 ? string(abi.encodePacked(baseURI, _toString(tokenId), ".json")) : '';
+    }
+
 
     // =============================================================    
     //                              WithDraw
