@@ -123,10 +123,33 @@ contract TheBook is ERC721A{
      * - `totalSupply + quantity < _MAX_NFT_SUPPLY`
      */
     function mint(address to, uint256 quantity) external onlyMinter(){
-        require(totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum supply exceeded.");
-        require(quantity + totalSupply() < _MAX_NFT_SUPPLY, "Limitation: Maximum quantity exceeded.");
+        require(totalSupply() <= _MAX_NFT_SUPPLY, "Limitation: Maximum supply exceeded.");
+        require(quantity + totalSupply() <= _MAX_NFT_SUPPLY, "Limitation: Maximum quantity exceeded.");
 
         _mint(to, quantity);
+    }
+
+    // =============================================================
+    //                          BATCH Transfer
+    // ============================================================= 
+    /**
+     * @dev Transfers `tokenIds` in batch from `from` to `to`.
+     *
+     * Requirements:
+     *
+     * - `from` cannot be the zero address.
+     * - `to` cannot be the zero address.
+     * - `tokenIds` tokens must be owned by `from`.
+     * - `tokenIds` must be strictly ascending.
+     *
+     * Emits a {Transfer} event for each transfer.
+     */
+    function batchTransferFrom(
+        address from,
+        address to,
+        uint256[] memory tokenIds
+    ) public payable {
+        _batchTransferFrom(from, to, tokenIds);
     }
 
     // =============================================================
