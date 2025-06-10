@@ -172,8 +172,7 @@ contract TheBook is ERC721A{
     function tokenURI(uint256 tokenId) public view virtual override(ERC721A) returns (string memory) {
         if (!_exists(tokenId)) _revert(URIQueryForNonexistentToken.selector);
 
-        string memory baseURI = _baseURI();
-        return bytes(baseURI).length != 0 ? string(abi.encodePacked(baseURI, _toString(tokenId), ".json")) : '';
+        return bytes(baseURI).length != 0 ? string(abi.encodePacked(_baseURI(), _toString(tokenId), ".json")) : '';
     }
 
 
