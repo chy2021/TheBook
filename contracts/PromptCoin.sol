@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 // PromptCoin Contract
 contract PromptCoin is ERC20, Ownable {
-    constructor() ERC20("PromptCoin", "PTC") {
+    constructor() ERC20("PromptCoin", "PTC") Ownable(msg.sender){
         _mint(msg.sender, 33_000_000 * 1e18);
     }
 }
