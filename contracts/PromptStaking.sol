@@ -24,11 +24,13 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 // PromptStaking 合约
 // 允许用户质押三种特定的NFT，并根据质押的NFT类型和数量分配PTC奖励
-contract PromptStaking is Ownable, ReentrancyGuard, ERC721Holder {
+contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // 定义质押信息结构体
     // 每个用户的质押信息包括NFT地址、tokenId、权重和质押时间戳
     struct StakeInfo {
