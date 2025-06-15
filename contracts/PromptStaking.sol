@@ -15,16 +15,19 @@
 // 用户可随时提取产出的可提取的PTC，可全部提取或部分提取。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT，但禁止提取PTC代币和三种质押NFT。
 // 合约使用OpenZeppelin的Ownable和ReentrancyGuard模块，确保合约安全性和所有权管理。
+// 计算收益的时间点，是在下一个区块的开始时间。比如当前区块的时间是 10:00-10:10，用户在 10:08 分开始质押，那么第一份收益将在 10:10-10:20 这个区块产生。
+// 取消质押的逻辑，也是取整，同上一个例子，用户在 10:18 取消质押，他的NFT真正取消质押的状态是10:10，收益就是上一个整区块及之前。
 
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 // PromptStaking 合约
 // 允许用户质押三种特定的NFT，并根据质押的NFT类型和数量分配PTC奖励
-contract PromptStaking is Ownable, ReentrancyGuard {
+contract PromptStaking is Ownable, ReentrancyGuard, ERC721Holder {
     // 定义质押信息结构体
     // 每个用户的质押信息包括NFT地址、tokenId、权重和质押时间戳
     struct StakeInfo {
@@ -40,11 +43,16 @@ contract PromptStaking is Ownable, ReentrancyGuard {
     // 奖励开始时间戳：用于计算奖励周期的起始时间
     // 此时间戳在合约部署时设置，之后不会更改
     uint256 public startRewardTimestamp; 
+    // 奖励结束时间戳：用于计算奖励周期的结束时间
+    // 此时间戳在合约部署时设置，之后不会更改
+    uint256 public endRewardTimestamp; 
 
     // 定义常量
     uint256 public constant PERIOD_DURATION = 600; // 10分钟，600秒
     uint256 public constant INITIAL_REWARD = 160 ether; // 初始每周期奖励160个PTC
     uint256 public constant HALVING_INTERVAL = 2 * 365 days; // 2年区块数
+    // 开始产出后364896000秒,第12年209天时全部产出
+    uint256 public constant PRODUCTION_DURATION = 364896000;
 
     // 三种支持的NFT地址
     address public immutable memoryNFT;
@@ -71,12 +79,24 @@ contract PromptStaking is Ownable, ReentrancyGuard {
     // PTC代币合约地址需要在部署前先部署PromptCoin合约并传入地址  
     // NFT合约地址需要在部署前先部署相应的NFT合约并传入地址
     // 合约部署后无法更改PTC代币和NFT合约地址
-    constructor(address _ptc, address _memory, address _prompt, address _memes) Ownable(msg.sender) {
+    constructor(
+        address _ptc,
+        address _memory,
+        address _prompt,
+        address _memes,
+        uint256 _startTime
+    ) Ownable(msg.sender) {
         ptc = IERC20(_ptc);
         memoryNFT = _memory;
         promptNFT = _prompt;
         memesNFT = _memes;
-        startRewardTimestamp = block.timestamp;// 设置奖励开始时间为合约部署时间
+        // 如果传入的_startTime为0，则用当前区块时间
+        if (_startTime == 0) {
+            startRewardTimestamp = block.timestamp;
+        } else {
+            startRewardTimestamp = _startTime;
+        }
+        endRewardTimestamp = startRewardTimestamp + PRODUCTION_DURATION;
     }
 
     // 修饰符：检查NFT是否为支持的三种NFT之一
@@ -115,32 +135,44 @@ contract PromptStaking is Ownable, ReentrancyGuard {
         }
     }
 
+    // 获取当前周期
+    function _getCurrentPeriod() internal view returns (uint256) {
+        uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
+        if (nowTime < startRewardTimestamp) {
+            return 0;
+        }
+        return (nowTime - startRewardTimestamp) / PERIOD_DURATION;
+    }
+
     // 核心函数：更新指定用户的奖励（惰性计算机制）
     // 计算用户在当前周期内的奖励，并更新用户的待领取奖励和总分配奖励
     // 此函数会在质押、解押和领取奖励时调用，确保用户的奖励是最新的
     function _updateReward(address user) internal {
-        // 如果用户没有质押NFT，则不需要更新奖励
         if (userWeight[user] == 0) {
-            return; // 用户没有质押NFT，则不需要更新奖励
+            return;
         }
-        // 获取当前周期和用户最后领取奖励的周期
-        uint256 currentPeriod = (block.timestamp - startRewardTimestamp) / PERIOD_DURATION;
+        uint256 currentPeriod = _getCurrentPeriod();
+        uint256 periodStart = startRewardTimestamp + currentPeriod * PERIOD_DURATION;
+
+        if (userLastClaimedTimestamp[user] == 0) {
+            userLastClaimedTimestamp[user] = periodStart + PERIOD_DURATION;
+            return;
+        }
+
         uint256 lastClaimedPeriod = (userLastClaimedTimestamp[user] - startRewardTimestamp) / PERIOD_DURATION;
         if (lastClaimedPeriod >= currentPeriod) {
-            return; // 如果已经同步到当前周期，则不需要更新
+            return;
         }
-        uint256 periods = currentPeriod - lastClaimedPeriod;
-        uint256 rewardPerPeriod = _getRewardPerPeriod();
+
+        // 限制奖励区间不超过产出结束
+        uint256 totalReward = _calculateTotalReward(lastClaimedPeriod, currentPeriod);
         if (totalWeight == 0) {
-            return; // 如果没有用户质押，则不分配奖励
+            return;
         }
-        // 计算总分配奖励和用户的奖励份额
-        uint256 totalReward = rewardPerPeriod * periods;
         uint256 userShare = (userWeight[user] * totalReward) / totalWeight;
-    
-        pendingReward[user] += userShare; // 更新用户待领取奖励
-        pendingReward[user] += userShare; // 更新用户待领取奖励
-        userLastClaimedTimestamp[user] = block.timestamp; // 更新用户最后领取奖励的时间戳
+
+        pendingReward[user] += userShare;
+        userLastClaimedTimestamp[user] = periodStart;
     }
 
     // 质押单个NFT
@@ -148,7 +180,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
     function stake(address nft, uint256 tokenId) external nonReentrant onlySupportedNFT(nft) {
         _updateReward(msg.sender); // 更新用户奖励
 
-        IERC721(nft).transferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
+        IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
 
         uint256 weight = _getWeight(nft); // 获取NFT的权重
         userStakes[msg.sender].push(StakeInfo({
@@ -178,7 +210,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
                 totalWeight -= weight; // 更新总权重
                 userWeight[msg.sender] -= weight; // 更新用户权重
 
-                IERC721(nft).transferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
+                IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
 
                 // 如果是最后一个元素，直接pop
                 if (i != len - 1) {
@@ -202,7 +234,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
         uint256 weight = _getWeight(nft); // 获取NFT的权重
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
-            IERC721(nft).transferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
+            IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
 
             userStakes[msg.sender].push(StakeInfo({
                 nft: nft,
@@ -238,7 +270,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
                     totalWeight -= weight; // 更新总权重
                     userWeight[msg.sender] -= weight; // 更新用户权重
 
-                    IERC721(nft).transferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
+                    IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
 
                     // 如果是最后一个元素，直接pop
                     if (j != len - 1) {
@@ -273,7 +305,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
                 totalWeight -= weight;
                 userWeight[msg.sender] -= weight;
 
-                IERC721(nft).transferFrom(address(this), msg.sender, stakes[idx].tokenId);
+                IERC721(nft).safeTransferFrom(address(this), msg.sender, stakes[idx].tokenId);
 
                  // 如果是最后一个元素，直接pop
                 if (idx != stakes.length - 1) {
@@ -297,7 +329,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
             uint256 tokenId = tokenIds[i];
             require(_isSupportedNFT(nft), "Unsupported NFT");
 
-            IERC721(nft).transferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
+            IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
 
             uint256 weight = _getWeight(nft); // 获取NFT的权重
             userStakes[msg.sender].push(StakeInfo({
@@ -336,7 +368,7 @@ contract PromptStaking is Ownable, ReentrancyGuard {
                     totalWeight -= weight; // 更新总权重
                     userWeight[msg.sender] -= weight; // 更新用户权重
 
-                    IERC721(nft).transferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
+                    IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId); // 转移NFT回用户
 
                     // 如果是最后一个元素，直接pop
                     if (j != len - 1) {
@@ -409,25 +441,20 @@ contract PromptStaking is Ownable, ReentrancyGuard {
     }
         
     // 查询用户当前可领取的PTC奖励（包含未更新周期）
-    function claimable(address user) external view returns (uint256) {
-        uint256 currentPeriod = (block.timestamp - startRewardTimestamp) / PERIOD_DURATION;
-        uint256 lastClaimedPeriod = (userLastClaimedTimestamp[user] - startRewardTimestamp) / PERIOD_DURATION;
-
-        // 若为首次调用，视为已同步到当前周期
-        if (userLastClaimedTimestamp[user] == 0 || lastClaimedPeriod >= currentPeriod) {
+    function claimable(address user) public view returns (uint256) {
+        if (userWeight[user] == 0) {
             return pendingReward[user];
         }
-
-        uint256 periods = currentPeriod - lastClaimedPeriod;
-        uint256 rewardPerPeriod = _getRewardPerPeriod();
-
+        uint256 currentPeriod = _getCurrentPeriod();
+        uint256 lastClaimedPeriod = (userLastClaimedTimestamp[user] - startRewardTimestamp) / PERIOD_DURATION;
+        if (lastClaimedPeriod >= currentPeriod) {
+            return pendingReward[user];
+        }
+        uint256 totalReward = _calculateTotalReward(lastClaimedPeriod, currentPeriod);
         if (totalWeight == 0) {
             return pendingReward[user];
         }
-
-        uint256 totalReward = rewardPerPeriod * periods;
         uint256 userShare = (userWeight[user] * totalReward) / totalWeight;
-
         return pendingReward[user] + userShare;
     }
 
@@ -488,5 +515,38 @@ contract PromptStaking is Ownable, ReentrancyGuard {
         IERC721 erc721 = IERC721(nft);
         require(erc721.ownerOf(tokenId) == address(this), "Token not owned by contract");
         erc721.transferFrom(address(this), to, tokenId);
+    }
+
+    // 计算从fromPeriod到toPeriod的总奖励
+    // 该函数用于计算在指定的时间段内，用户可以获得的总奖励
+    // fromPeriod和toPeriod是基于初始奖励开始时间戳和周期持续时间计算的
+    function _calculateTotalReward(uint256 fromPeriod, uint256 toPeriod) internal view returns (uint256) {
+        // 限制toPeriod不超过产出结束周期
+        uint256 endPeriod = (endRewardTimestamp - startRewardTimestamp) / PERIOD_DURATION;
+        if (toPeriod > endPeriod) {
+            toPeriod = endPeriod;
+        }
+        uint256 totalReward = 0;
+        uint256 periodStart = fromPeriod;
+        while (periodStart < toPeriod) {
+            uint256 halvingRound = ((periodStart * PERIOD_DURATION + startRewardTimestamp) / HALVING_INTERVAL);
+            uint256 nextHalvingPeriod = ((halvingRound + 1) * HALVING_INTERVAL - startRewardTimestamp) / PERIOD_DURATION;
+            uint256 periodEnd = nextHalvingPeriod < toPeriod ? nextHalvingPeriod : toPeriod;
+            uint256 rewardPerPeriod = INITIAL_REWARD >> halvingRound;
+            uint256 periods = periodEnd - periodStart;
+            totalReward += rewardPerPeriod * periods;
+            periodStart = periodEnd;
+        }
+        return totalReward;
+    }
+
+    // 奖励是否已经产完
+    function isProductionFinished() public view returns (bool) {
+        return block.timestamp >= endRewardTimestamp;
+    }
+
+    // 产出结束时间戳
+    function getEndRewardTimestamp() public view returns (uint256) {
+        return endRewardTimestamp;
     }
 }
