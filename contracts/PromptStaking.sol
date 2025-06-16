@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
-// NFT质押合约
+// NFT质押合约（全局积分累加器模型）
 //
-// 质押规定好的三种NFT，名称分别是Memory，Prompt和Memes，按质押权重占比分配产出PTC。
-// 如果把Prompt 的算力权重记为 50，那么 Memory 的算力权重就是1，Meme的算力权重就是 2500。
+// 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
+// 权重：Prompt=50，Memory=1，Memes=2500。
 // 奖励周期Period:固定周期产出固定数量，每隔一个产出周期（10分钟，使用时间戳），产出160个PTC。
 // 减半周期Round:每两年进行一次固定产出数量减半。
 // 无预留、预挖等其他产出方法。
@@ -29,7 +29,6 @@ import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 // PromptStaking 合约
-// 允许用户质押三种特定的NFT，并根据质押的NFT类型和数量分配PTC奖励
 contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // 定义质押信息结构体
     // 每个用户的质押信息包括NFT地址、tokenId、权重和质押时间戳
@@ -39,23 +38,18 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 weight;
         uint256 stakedAt; 
     }
+    // 定义用户信息结构体
     struct UserInfo {
         StakeInfo[] stakes;
-        uint256 weight;
-        uint256 rewardDebt; // 上次操作时的accRewardPerWeight * weight
-        uint256 pendingReward;
-        uint256 claimed;
+        uint256 weight;         // 当前总权重
+        uint256 rewardDebt;     // 上次操作时的accRewardPerWeight * weight
+        uint256 pendingReward;  // 待领取奖励
+        uint256 claimed;        // 累计已领取奖励
     }
 
-    // PTC代币合约地址
-    IERC20 public immutable ptc; 
-
-    // 奖励开始时间戳：用于计算奖励周期的起始时间
-    // 此时间戳在合约部署时设置，之后不会更改
-    uint256 public startRewardTimestamp; 
-    // 奖励结束时间戳：用于计算奖励周期的结束时间
-    // 此时间戳在合约部署时设置，之后不会更改
-    uint256 public endRewardTimestamp; 
+    IERC20 public immutable ptc; // PTC代币合约
+    uint256 public startRewardTimestamp; // 奖励产出起始时间
+    uint256 public endRewardTimestamp;   // 奖励产出结束时间
 
     // 定义常量
     uint256 public constant PERIOD_DURATION = 600; // 10分钟，600秒
@@ -70,7 +64,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     address public immutable memesNFT;
 
     // 用户质押信息
-    mapping(address => UserInfo) public users;
+    mapping(address => UserInfo) public users; // 用户质押信息
     
     // 全局积分累加器
     uint256 public accRewardPerWeight; // 1e18精度
@@ -151,6 +145,12 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // 根据当前时间戳和初始奖励计算当前周期的奖励数量
     function _getRewardPerPeriod() internal view returns (uint256) {
         uint256 halvings = _getHalvingRounds();
+        return halvings == 0 ? INITIAL_REWARD : INITIAL_REWARD >> halvings;
+    }
+
+    // 获取指定时间戳的奖励数量
+    function _getRewardPerPeriod(uint256 timestamp) internal view returns (uint256) {
+        uint256 halvings = (timestamp - startRewardTimestamp) / HALVING_INTERVAL;
         if (halvings == 0) {
             return INITIAL_REWARD; // 初始奖励
         } else {
@@ -165,16 +165,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             return 0;
         }
         return (nowTime - startRewardTimestamp) / PERIOD_DURATION;
-    }
-
-    // 获取指定时间戳的奖励数量
-    function _getRewardPerPeriod(uint256 timestamp) internal view returns (uint256) {
-        uint256 halvings = (timestamp - startRewardTimestamp) / HALVING_INTERVAL;
-        if (halvings == 0) {
-            return INITIAL_REWARD; // 初始奖励
-        } else {
-            return INITIAL_REWARD >> halvings; // 每次减半
-        }
     }
 
     // 更新全局奖励状态
