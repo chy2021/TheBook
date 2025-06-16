@@ -68,7 +68,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     
     // 全局积分累加器
     uint256 public accRewardPerWeight; // 1e18精度
-    
+    // 上次奖励计算时间戳
+    uint256 public lastRewardTimestamp;
     // 全局权重变量
     uint256 public totalWeight; // 全局总权重（所有用户的权重之和
 
