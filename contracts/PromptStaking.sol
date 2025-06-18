@@ -4,13 +4,11 @@
 //
 // 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
 // 权重：Prompt=50，Memory=1，Memes=2500。
-// 奖励周期Period:固定周期产出固定数量，每隔一个产出周期（10分钟，使用时间戳），产出160个PTC。
-// 减半周期Round:每两年进行一次固定产出数量减半。
+// 产出速率:初始每10分钟产出160个PTC。
+// 减半周期:每两年进行一次固定产出数量减半。
 // 无预留、预挖等其他产出方法。
-// 奖励采用全局积分累加器模型，确保每次操作都能正确计算奖励。产出是连续的。
-// 用户可随时质押和解除质押。
-// 用户可个别质押或批量质押NFT。
-// 用户可个别解押或批量解押或全部解押NFT。
+// 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出
+// 质押/解押/领取奖励均可单个或批量操作，支持随时领取全部或部分奖励。
 // 批量质押和解押NFT，支持同类型和不同类型的批量操作。
 // 用户可随时提取产出的可提取的PTC，可全部提取或部分提取。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT，但禁止提取PTC代币和三种质押NFT。
@@ -33,7 +31,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     struct StakeInfo {
         address nft;
         uint256 tokenId;
-        uint256 weight;
         uint256 stakedAt; 
     }
     // 定义用户信息结构体
@@ -45,25 +42,23 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 claimed;        // 累计已领取奖励
     }
 
-    IERC20 public immutable ptc; // PTC代币合约
-    uint256 public startRewardTimestamp; // 奖励产出起始时间
-    uint256 public endRewardTimestamp;   // 奖励产出结束时间
+    // PTC代币合约
+    IERC20 public immutable ptc; 
+    // 三种支持的NFT地址
+    address public immutable memoryNFT;
+    address public immutable promptNFT;
+    address public immutable memesNFT;
 
     // 定义常量
     uint256 public constant PERIOD_DURATION = 600; // 10分钟，600秒
     uint256 public constant INITIAL_REWARD = 160 ether; // 初始每周期奖励160个PTC
     uint256 public constant HALVING_INTERVAL = 2 * 365 days; // 2年区块数
     // 开始产出后364896000秒,第12年209天时全部产出
-    uint256 public constant PRODUCTION_DURATION = 364896000;
+    uint256 public constant PRODUCTION_DURATION = 364896000; 
 
-    // 三种支持的NFT地址
-    address public immutable memoryNFT;
-    address public immutable promptNFT;
-    address public immutable memesNFT;
+    uint256 public startRewardTimestamp; // 奖励产出起始时间
+    uint256 public endRewardTimestamp;   // 奖励产出结束时间
 
-    // 用户质押信息
-    mapping(address => UserInfo) public users; // 用户质押信息
-    
     // 全局积分累加器
     uint256 public accRewardPerWeight; // 1e18精度
     // 上次奖励计算时间戳
@@ -71,12 +66,21 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // 全局权重变量
     uint256 public totalWeight; // 全局总权重（所有用户的权重之和
 
+    // 用户质押信息
+    mapping(address => UserInfo) public users; // 用户质押信息
+     
+    // 手续费接收地址和费率
+    address public feeRecipient;
+    // 手续费率，单位为1e4（即0.01%）
+    uint256 public feeRate;      // 1e4为单位
+    // 累计未提取手续费
+    uint256 public pendingFee;   // 累计未提取手续费
+
     // 事件定义:质押、解押和领取奖励事件
     event Staked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
     event Unstaked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
     event Claimed(address indexed user, uint256 amount, uint256 timestamp);
     event EmergencyUnstake(address indexed user, address indexed nft, uint256 tokenId, uint256 timestamp);
-    event RewardAccrued(address indexed user, uint256 amount, uint256 fromPeriod, uint256 toPeriod, uint256 timestamp);
     
     // 合约暂停和恢复事件
     event Paused(address indexed operator, uint256 timestamp);
@@ -107,11 +111,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         promptNFT = _promptNFT;
         memesNFT = _memesNFT;
         // 如果传入的_startTime为0，则用当前区块时间
-        if (_startTime == 0) {
-            startRewardTimestamp = block.timestamp;
-        } else {
-            startRewardTimestamp = _startTime;
-        }
+        startRewardTimestamp = _startTime == 0 ? block.timestamp : _startTime;
         endRewardTimestamp = startRewardTimestamp + PRODUCTION_DURATION;
     }
 
@@ -134,40 +134,9 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         revert("Unsupported NFT");
     }
 
-    // 获取当前已经经过的减半周期数
-    // 根据当前时间戳和初始奖励开始时间戳计算已经经过的减半周期数
-    function _getHalvingRounds() internal view returns (uint256) {
-        return (block.timestamp - startRewardTimestamp) / HALVING_INTERVAL;
-    }
-
-    // 获取当前周期的奖励数量
-    // 根据当前时间戳和初始奖励计算当前周期的奖励数量
-    function _getRewardPerPeriod() internal view returns (uint256) {
-        uint256 halvings = _getHalvingRounds();
-        return halvings == 0 ? INITIAL_REWARD : INITIAL_REWARD >> halvings;
-    }
-
-    // 获取指定时间戳的奖励数量
-    function _getRewardPerPeriod(uint256 timestamp) internal view returns (uint256) {
-        uint256 halvings = (timestamp - startRewardTimestamp) / HALVING_INTERVAL;
-        if (halvings == 0) {
-            return INITIAL_REWARD; // 初始奖励
-        } else {
-            return INITIAL_REWARD >> halvings; // 每次减半
-        }
-    }
-
-    // 获取当前周期
-    function _getCurrentPeriod() internal view returns (uint256) {
-        uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
-        if (nowTime < startRewardTimestamp) {
-            return 0;
-        }
-        return (nowTime - startRewardTimestamp) / PERIOD_DURATION;
-    }
-
     // 更新全局奖励状态
     // 该函数会在每次质押、解押和领取奖励时调用，确保全局奖励状态是最新的
+    // 奖励计算基于全局积分累加器模型，周期奖励和线性插值
     function _updateGlobal() internal {
         uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
         if (lastRewardTimestamp == 0) lastRewardTimestamp = startRewardTimestamp;
@@ -180,18 +149,29 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 to = nowTime;
         uint256 reward = 0;
         while (from < to) {
-            uint256 periodEnd = ((from - startRewardTimestamp) / PERIOD_DURATION + 1) * PERIOD_DURATION + startRewardTimestamp;
-            if (periodEnd > to) periodEnd = to;
-            uint256 rewardPerPeriod = _getRewardPerPeriod(from);
-            reward += rewardPerPeriod * (periodEnd - from) / PERIOD_DURATION;
-            from = periodEnd;
+            // 当前from所在的减半区间的结束时间
+            uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
+            uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
+            if (halvingEnd > to) halvingEnd = to;
+            uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
+            uint256 duration = halvingEnd - from;
+            // 直接累加这段时间的奖励
+            reward += rewardPerPeriod * duration / PERIOD_DURATION;
+            from = halvingEnd;
         }
-        accRewardPerWeight += reward * 1e18 / totalWeight;
+        // 计算本次应收手续费
+        uint256 fee = reward * feeRate / 1e4;
+        pendingFee += fee;
+        // 分配给用户
+        accRewardPerWeight += (reward - fee) * 1e18 / totalWeight;
         lastRewardTimestamp = nowTime;
     }
 
     // 更新指定用户的奖励
     // 该函数会在每次质押、解押和领取奖励时调用，确保用户的奖励状态是最新的
+    // 用户的奖励是基于全局积分累加器模型计算的
+    // 用户的奖励计算公式为：用户权重 * (accRewardPerWeight - 用户上次操作时的accRewardPerWeight) / 1e18
+    // 用户的奖励会累加到用户的pendingReward中，并更新用户的rewardDebt
     function _updateReward(address user) internal {
         _updateGlobal();
         UserInfo storage u = users[user];
@@ -213,7 +193,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         users[msg.sender].stakes.push(StakeInfo({
             nft: nft,
             tokenId: tokenId,
-            weight: weight,
             stakedAt: block.timestamp // 记录质押时间戳
         }));
 
@@ -237,7 +216,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             users[msg.sender].stakes.push(StakeInfo({
                 nft: nft,
                 tokenId: tokenId,
-                weight: weight,
                 stakedAt: block.timestamp // 记录质押时间戳
             }));
 
@@ -267,7 +245,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             users[msg.sender].stakes.push(StakeInfo({
                 nft: nft,
                 tokenId: tokenId,
-                weight: weight,
                 stakedAt: block.timestamp // 记录质押时间戳
             }));
 
@@ -419,21 +396,19 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             uint256 to = nowTime;
             uint256 reward = 0;
             while (from < to) {
-                uint256 periodEnd = ((from - startRewardTimestamp) / PERIOD_DURATION + 1) * PERIOD_DURATION + startRewardTimestamp;
-                if (periodEnd > to) periodEnd = to;
-                uint256 rewardPerPeriod = _getRewardPerPeriod(from);
-                reward += rewardPerPeriod * (periodEnd - from) / PERIOD_DURATION;
-                from = periodEnd;
+                uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
+                uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
+                if (halvingEnd > to) halvingEnd = to;
+                uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
+                uint256 duration = halvingEnd - from;
+                reward += rewardPerPeriod * duration / PERIOD_DURATION;
+                from = halvingEnd;
             }
-            acc += reward * 1e18 / totalWeight;
+            // 计算本次应收手续费
+            uint256 fee = reward * feeRate / 1e4;
+            acc +=  (reward - fee) * 1e18 / totalWeight;
         }
         return u.pendingReward + (u.weight * (acc - u.rewardDebt) / 1e18);
-    }
-
-
-    // 获取用户的权重
-    function getUserWeight(address user) external view returns (uint256) {
-        return users[user].weight;
     }
 
     // 获取用户所有质押NFT信息
@@ -453,11 +428,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             result[i - start] = stakes[i];
         }
         return result;
-    }
-
-    // 查看当前周期奖励
-    function currentRewardPerPeriod() external view returns (uint256) {
-        return _getRewardPerPeriod();
     }
 
     // 查看合约剩余的 PTC 总量
@@ -520,13 +490,31 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         }
     }
 
+    // 设置手续费接收地址和费率
+    // 费率单位为1e4（即0.01%），最大值为1000（即100%）
+    function setFee(address _recipient, uint256 _rate) external onlyOwner {
+        require(_rate <= 10000, "Fee too high");
+        feeRecipient = _recipient;
+        feeRate = _rate;
+    }
+
+    // 允许手续费接收地址提取累计的手续费
+    function claimFee() external {
+        require(msg.sender == feeRecipient, "Not fee recipient");
+        uint256 amount = pendingFee;
+        require(amount > 0, "No fee to claim");
+        require(ptc.balanceOf(address(this)) >= amount, "Insufficient PTC balance in contract");
+        pendingFee = 0;
+        ptc.transfer(feeRecipient, amount);
+    }
+
     // 合约暂停功能
     function pause() external onlyOwner {
         _pause();
         emit Paused(msg.sender, block.timestamp);
     }
 
-    // 恢复合约
+    // 合约恢复功能
     function unpause() external onlyOwner {
         _unpause();
         emit Unpaused(msg.sender, block.timestamp);
