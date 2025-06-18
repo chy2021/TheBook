@@ -265,7 +265,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
         for (uint256 i = 0; i < len; i++) {
             if (stakes[i].nft == nft && stakes[i].tokenId == tokenId) {
-                uint256 weight = stakes[i].weight;
+                uint256 weight = _getWeight(nft);
                 totalWeight -= weight; // 更新总权重
                 users[msg.sender].weight -= weight; // 更新用户权重
 
@@ -300,7 +300,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
             for (uint256 j = 0; j < len; j++) {
                 if (stakes[j].nft == nft && stakes[j].tokenId == tokenId) {
-                    uint256 weight = stakes[j].weight;
+                    uint256 weight = _getWeight(nft);
                     totalWeight -= weight; // 更新总权重
                     users[msg.sender].weight -= weight; // 更新用户权重
 
@@ -335,7 +335,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             uint256 idx = i - 1;
             if (stakes[idx].nft == nft) {
                 uint256 tokenId = stakes[idx].tokenId; // 先保存tokenId
-                uint256 weight = stakes[idx].weight;
+                uint256 weight = _getWeight(nft);
                 totalWeight -= weight;
                 users[msg.sender].weight -= weight;
 
