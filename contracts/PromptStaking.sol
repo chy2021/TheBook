@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
-// NFT质押合约（全局积分累加器模型）
+// NFT质押合约
 //
 // 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
 // 权重：Prompt=50，Memory=1，Memes=2500。
@@ -9,8 +9,7 @@
 // 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持批量质押和解押NFT，支持同类型和不同类型的批量操作。
-// 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT，但禁止提取PTC代币和三种质押NFT。
-// 无预留、预挖等其他产出方法。无人质押和插队稀释导致的丢失奖励视为销毁。
+// 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
 
 pragma solidity ^0.8.20;
 
@@ -92,10 +91,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         address _memesNFT,
         uint256 _startTime
     ) Ownable(msg.sender) {
-        require(_ptc != address(0), "PTC address zero");
-        require(_memoryNFT != address(0), "MemoryNFT address zero");
-        require(_promptNFT != address(0), "PromptNFT address zero");
-        require(_memesNFT != address(0), "MemesNFT address zero");
+        require(_ptc != address(0), "address zero");
+        require(_memoryNFT != address(0), "address zero");
+        require(_promptNFT != address(0), "address zero");
+        require(_memesNFT != address(0), "address zero");
 
         ptc = IERC20(_ptc);
         memoryNFT = _memoryNFT;
@@ -163,8 +162,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
     /// @notice 更新指定用户的奖励（全局积分累加器模型）
     // 该函数会在每次质押、解押和领取奖励时调用，确保用户的奖励状态是最新的
-    // 用户的奖励是基于全局积分累加器模型计算的
-    // 用户的奖励计算公式为：用户权重 * (accRewardPerWeight - 用户上次操作时的accRewardPerWeight) / 1e18
     function _updateReward(address user) internal {
         _updateGlobal();
         UserInfo storage u = users[user];
@@ -193,7 +190,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 批量质押同类型NFT
-    // 用户可以批量质押同类型的NFT，合约会自动计算权重并更新用户的质押信息
     function stakeBatch(address nft, uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         require(tokenIds.length > 0, "No token IDs provided");
         _updateReward(msg.sender);
@@ -212,7 +208,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 批量质押不同类型NFT
-    // 用户可以批量质押不同类型的NFT，合约会自动计算权重并更新用户的质押信息
     function stakeBatch(address[] calldata nfts, uint256[] calldata tokenIds) external nonReentrant whenNotPaused {
         require(nfts.length == tokenIds.length, "Length mismatch");
         _updateReward(msg.sender);
@@ -233,7 +228,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 解押单个NFT
-    // 用户可以解押单个NFT，合约会自动更新用户的质押信息和权重
     function unstake(address nft, uint256 tokenId) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         _updateReward(msg.sender);
         StakeInfo[] storage stakes = users[msg.sender].stakes;
@@ -258,7 +252,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
     
     /// @notice 批量解押同类型NFT
-    // 用户可以批量解押同类型的NFT，合约会自动更新用户的质押信息和权重
     // 注意：用户质押nft数量太多可能导致gas高甚至超过上限而无法执行
     function unstakeBatch(address nft, uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         require(tokenIds.length > 0, "No token IDs provided");
@@ -290,7 +283,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 解押同类型所有NFT
-    // 用户可以解押单种NFT，合约会自动更新用户的质押信息和权重
     // 注意：用户质押nft数量太多可能导致gas高甚至超过上限而无法执行
     function unstake(address nft) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         _updateReward(msg.sender);
@@ -313,32 +305,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                 emit Unstaked(msg.sender, nft, tid, weight, block.timestamp);
                 IERC721(nft).safeTransferFrom(address(this), msg.sender, tid);
             }
-        }
-    }
-
-    /// @notice 按索引批量解押NFT（适合大户高效解押）
-    /// @param indexes 用户stakes数组中的索引（建议前端逆序、去重、分批处理）
-    /// 索引可通过 getStakedNFTs(address user, uint256 start, uint256 end) 查询
-    function unstakeByIndexes(uint256[] calldata indexes) external nonReentrant whenNotPaused {
-        _updateReward(msg.sender);
-        StakeInfo[] storage stakes = users[msg.sender].stakes;
-        require(indexes.length > 0, "No indexes provided");
-        // 建议前端传入已排序且去重的索引，合约逆序遍历，避免pop后索引错乱
-        for (uint256 i = indexes.length; i > 0; i--) {
-            uint256 idx = indexes[i - 1];
-            require(idx < stakes.length, "Index out of range");
-            uint256 weight = _getWeight(stakes[idx].nft);
-            address nftAddr = stakes[idx].nft;
-            uint256 tid = stakes[idx].tokenId;
-            totalWeight -= weight;
-            users[msg.sender].weight -= weight;
-            // 用最后一个元素覆盖被移除的元素，然后pop，保持数组紧凑
-            if (idx != stakes.length - 1) {
-                stakes[idx] = stakes[stakes.length - 1];
-            }
-            stakes.pop();
-            emit Unstaked(msg.sender, nftAddr, tid, weight, block.timestamp);
-            IERC721(nftAddr).safeTransferFrom(address(this), msg.sender, tid);
         }
     }
 
@@ -371,7 +337,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         UserInfo storage u = users[msg.sender];
         uint256 reward = u.pendingReward;
         require(reward > 0, "No claimable reward");
-        require(ptc.balanceOf(address(this)) >= reward, "Insufficient PTC balance in contract");
+        require(ptc.balanceOf(address(this)) >= reward, "Insufficient balance");
         u.pendingReward = 0;
         u.claimed += reward;
         emit Claimed(msg.sender, reward, block.timestamp);
@@ -385,7 +351,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
         require(amount > 0, "Amount must be greater than zero");
         require(amount <= u.pendingReward, "Amount exceeds claimable reward");
-        require(ptc.balanceOf(address(this)) >= amount, "Insufficient PTC balance in contract");
+        require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
 
         u.pendingReward -= amount;
         u.claimed += amount;
@@ -412,7 +378,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                 reward += rewardPerPeriod * duration / PERIOD_DURATION;
                 from = halvingEnd;
             }
-            // 计算本次应收手续费
             uint256 fee = reward * feeRate / 1e4;
             acc +=  (reward - fee) * 1e18 / totalWeight;
         }
@@ -420,7 +385,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 分页获取用户质押NFT信息
-    // 用户质押nft数量太多时使用
     function getStakedNFTs(address user, uint256 start, uint256 end) external view returns (StakeInfo[] memory) {
         StakeInfo[] storage stakes = users[user].stakes;
         require(start < end && end <= stakes.length, "Invalid range");
@@ -441,7 +405,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
     /// @notice 救援合约内误转入的主网币
     function rescueGAS(address payable to, uint256 amount) external nonReentrant onlyOwner {
-        require(amount <= address(this).balance, "Amount exceeds contract balance");
+        require(amount <= address(this).balance, "Amount exceeds balance");
         (bool success, ) = to.call{value: amount}("");
         require(success, "Transfer failed");
         emit GASRescued(msg.sender, amount, block.timestamp);
@@ -465,9 +429,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 紧急批量解押（仅暂停时可用，不结算奖励）
-    // 允许用户在紧急情况下批量解押NFT
     // 注意：紧急解押不会计算奖励，直接将NFT转回用户
-    // 该函数仅在合约暂停时可用，防止在正常运行时误用
     function emergencyUnstakeBatch(uint256 count) external nonReentrant whenPaused {
         StakeInfo[] storage stakes = users[msg.sender].stakes;
         require(stakes.length > 0, "No NFT staked");
@@ -487,7 +449,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 设置手续费接收地址和费率（仅owner可调）
-    /// @param _recipient 手续费接收地址
     /// @param _rate 手续费率，单位1e4，最大10000（100%）
     function setFee(address _recipient, uint256 _rate) external onlyOwner {
         require(_rate <= 10000, "Fee too high");
@@ -497,10 +458,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
     /// @notice 手续费接收地址提取累计手续费
     function claimFee() external nonReentrant {
-        require(msg.sender == feeRecipient, "Not fee recipient");
+        require(msg.sender == feeRecipient, "Not recipient");
         uint256 amount = pendingFee;
-        require(amount > 0, "No fee to claim");
-        require(ptc.balanceOf(address(this)) >= amount, "Insufficient PTC balance in contract");
+        require(amount > 0, "No fee");
+        require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
         pendingFee = 0;
         ptc.safeTransfer(feeRecipient, amount);
     }
