@@ -67,6 +67,11 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public feeRate;      // 手续费率，单位1e4（100=1%）
     uint256 public pendingFee;   // 累计未提取手续费
 
+    address public pendingFeeRecipient; // 待变更的手续费接收地址
+    uint256 public pendingFeeRate;      // 待变更的手续费率
+    uint256 public feeRateChangeTime;   // 手续费变更时间锁
+    uint256 public constant FEE_CHANGE_DELAY = 1 days;// 手续费变更时间锁延迟（1天）
+
     // -------------------- 事件定义 --------------------
     event Staked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
     event Unstaked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
@@ -77,29 +82,36 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event ERC20Rescued(address indexed operator, address token, uint256 amount, uint256 timestamp);
     event ERC721Rescued(address indexed operator, address nft, uint256 tokenId, uint256 timestamp);
     event GASRescued(address indexed operator, uint256 amount, uint256 timestamp);
-    
+    event FeeRateProposed(address indexed proposer, address newRecipient, uint256 newRate, uint256 executeTime);
+    event FeeRateChanged(address indexed executor, address newRecipient, uint256 newRate);
+    event FeeClaimed(address indexed recipient, uint256 amount, uint256 timestamp);
+
     /// @notice 构造函数，初始化PTC和NFT合约地址及奖励起始时间
     /// @param _ptc PTC代币地址
     /// @param _memoryNFT Memory NFT地址
     /// @param _promptNFT Prompt NFT地址
     /// @param _memesNFT Memes NFT地址
     /// @param _startTime 奖励产出起始时间（0为立即开始）
+    /// @param _feeRecipient 手续费接收地址
     constructor(
         address _ptc,
         address _memoryNFT,
         address _promptNFT,
         address _memesNFT,
-        uint256 _startTime
+        uint256 _startTime,
+        address _feeRecipient
     ) Ownable(msg.sender) {
         require(_ptc != address(0), "address zero");
         require(_memoryNFT != address(0), "address zero");
         require(_promptNFT != address(0), "address zero");
         require(_memesNFT != address(0), "address zero");
+        require(_feeRecipient != address(0), "address zero");
 
         ptc = IERC20(_ptc);
         memoryNFT = _memoryNFT;
         promptNFT = _promptNFT;
         memesNFT = _memesNFT;
+        feeRecipient = _feeRecipient;
         if (_startTime == 0) {
             startRewardTimestamp = block.timestamp;
         } else {
@@ -399,21 +411,23 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @notice 救援合约内误转入的ERC20代币（禁止PTC）
     function rescueERC20(address token, uint256 amount) external nonReentrant onlyOwner {
         require(token != address(ptc), "Cannot rescue PTC");
+        require(token != address(0), "Zero address");
         emit ERC20Rescued(msg.sender, token, amount, block.timestamp);
         IERC20(token).safeTransfer(owner(), amount);
     }
 
     /// @notice 救援合约内误转入的主网币
-    function rescueGAS(address payable to, uint256 amount) external nonReentrant onlyOwner {
+    function rescueGAS(uint256 amount) external nonReentrant onlyOwner {
         require(amount <= address(this).balance, "Amount exceeds balance");
-        (bool success, ) = to.call{value: amount}("");
-        require(success, "Transfer failed");
         emit GASRescued(msg.sender, amount, block.timestamp);
+        (bool success, ) = owner().call{value: amount}("");
+        require(success, "Transfer failed");
     }
 
     /// @notice 救援合约内误转入的ERC721 NFT（禁止三种质押NFT）
     function rescueERC721(address nft, uint256 tokenId) external nonReentrant onlyOwner {
         require(!_isSupportedNFT(nft), "Cannot rescue staked NFT");
+        require(nft != address(0), "Zero address");
         emit ERC721Rescued(msg.sender, nft, tokenId, block.timestamp);
         IERC721(nft).safeTransferFrom(address(this), owner(), tokenId);
     }
@@ -448,12 +462,32 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         users[msg.sender].rewardDebt = accRewardPerWeight;
     }
 
-    /// @notice 设置手续费接收地址和费率（仅owner可调）
+    /// @notice 提议变更手续费接收地址和费率
+    /// @dev 变更需要经过时间锁，防止恶意操作
     /// @param _rate 手续费率，单位1e4，最大10000（100%）
-    function setFee(address _recipient, uint256 _rate) external onlyOwner {
+    /// @param _recipient 新的手续费接收地址
+    function proposeFeeChange(address _recipient, uint256 _rate) external onlyOwner {
         require(_rate <= 10000, "Fee too high");
-        feeRecipient = _recipient;
-        feeRate = _rate;
+        require(_recipient != address(0), "Zero address");
+        require(pendingFeeRecipient != feeRecipient || pendingFeeRate != feeRate,"No change");
+        // 只有最后一次 propose 的参数会生效
+        pendingFeeRecipient = _recipient;
+        pendingFeeRate = _rate;
+        feeRateChangeTime = block.timestamp + FEE_CHANGE_DELAY;
+        emit FeeRateProposed(msg.sender, _recipient, _rate, feeRateChangeTime);
+    }
+
+    /// @notice 手续费变更时间锁，单位秒
+    function applyFeeChange() external onlyOwner {
+        require(feeRateChangeTime > 0 && block.timestamp >= feeRateChangeTime, "Not ready");
+        require(pendingFeeRecipient != feeRecipient || pendingFeeRate != feeRate,"No change");
+        feeRecipient = pendingFeeRecipient;
+        feeRate = pendingFeeRate;
+        emit FeeRateChanged(msg.sender, feeRecipient, feeRate);
+        // 清空pending
+        feeRateChangeTime = 0;
+        pendingFeeRecipient = address(0);
+        pendingFeeRate = 0;
     }
 
     /// @notice 手续费接收地址提取累计手续费
@@ -463,6 +497,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         require(amount > 0, "No fee");
         require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
         pendingFee = 0;
+        emit FeeClaimed(msg.sender, amount, block.timestamp); 
         ptc.safeTransfer(feeRecipient, amount);
     }
 
