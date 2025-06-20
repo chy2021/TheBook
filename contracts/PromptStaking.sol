@@ -23,7 +23,9 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 using SafeERC20 for IERC20;
 
-/// @title PromptStaking - NFT质押挖矿合约
+/// @title PromptStaking
+/// @notice 支持三种NFT的PTC奖励质押合约
+/// @author Thebook
 contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @notice 用户单个NFT质押信息
     struct StakeInfo {
@@ -73,18 +75,16 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public constant FEE_CHANGE_DELAY = 1 days;// 手续费变更时间锁延迟（1天）
 
     // -------------------- 事件定义 --------------------
-    event Staked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
-    event Unstaked(address indexed user, address indexed nft, uint256 tokenId, uint256 weight, uint256 timestamp);
-    event Claimed(address indexed user, uint256 amount, uint256 timestamp);
-    event EmergencyUnstake(address indexed user, address indexed nft, uint256 tokenId, uint256 timestamp);
-    event Paused(address indexed operator, uint256 timestamp);
-    event Unpaused(address indexed operator, uint256 timestamp);
-    event ERC20Rescued(address indexed operator, address token, uint256 amount, uint256 timestamp);
-    event ERC721Rescued(address indexed operator, address nft, uint256 tokenId, uint256 timestamp);
-    event GASRescued(address indexed operator, uint256 amount, uint256 timestamp);
+    event Staked(address indexed user, address indexed nft, uint256 tokenId);
+    event Unstaked(address indexed user, address indexed nft, uint256 tokenId);
+    event Claimed(address indexed user, uint256 amount);
+    event EmergencyUnstake(address indexed user, address indexed nft, uint256 tokenId);
+    event ERC20Rescued(address indexed operator, address token, uint256 amount);
+    event ERC721Rescued(address indexed operator, address nft, uint256 tokenId);
+    event GASRescued(address indexed operator, uint256 amount);
     event FeeRateProposed(address indexed proposer, address newRecipient, uint256 newRate, uint256 executeTime);
     event FeeRateChanged(address indexed executor, address newRecipient, uint256 newRate);
-    event FeeClaimed(address indexed recipient, uint256 amount, uint256 timestamp);
+    event FeeClaimed(address indexed recipient, uint256 amount);
 
     /// @notice 构造函数，初始化PTC和NFT合约地址及奖励起始时间
     /// @param _ptc PTC代币地址
@@ -184,6 +184,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         u.rewardDebt = accRewardPerWeight;
     }
 
+    // ========== 质押解押相关 ==========
     /// @notice 质押单个NFT
     function stake(address nft, uint256 tokenId) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         _updateReward(msg.sender); // 更新用户奖励
@@ -197,7 +198,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         users[msg.sender].weight += weight; // 更新用户权重
         totalWeight += weight; // 更新总权重
 
-        emit Staked(msg.sender, nft, tokenId, weight, block.timestamp); // 触发质押事件
+        emit Staked(msg.sender, nft, tokenId); // 触发质押事件
         IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
     }
 
@@ -206,15 +207,15 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         require(tokenIds.length > 0, "No token IDs provided");
         _updateReward(msg.sender);
         uint256 weight = _getWeight(nft);
+        uint256 totalAdd = weight * tokenIds.length;
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
             users[msg.sender].stakes.push(StakeInfo(nft, tokenId, block.timestamp));
-            users[msg.sender].weight += weight;
-            totalWeight += weight;
-            emit Staked(msg.sender, nft, tokenId, weight, block.timestamp);
         }
-
+        users[msg.sender].weight += totalAdd;
+        totalWeight += totalAdd;
         for (uint256 i = 0; i < tokenIds.length; i++) {
+            emit Staked(msg.sender, nft, tokenIds[i]);
             IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenIds[i]);
         }
     }
@@ -223,18 +224,19 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     function stakeBatch(address[] calldata nfts, uint256[] calldata tokenIds) external nonReentrant whenNotPaused {
         require(nfts.length == tokenIds.length, "Length mismatch");
         _updateReward(msg.sender);
+        uint256 totalAdd = 0;
         for (uint256 i = 0; i < nfts.length; i++) {
             address nft = nfts[i];
-            uint256 tokenId = tokenIds[i];
-            require(nft == promptNFT || nft == memoryNFT || nft == memesNFT, "Unsupported NFT");
+            require(!_isSupportedNFT(nft), "Unsupported NFT");
             uint256 weight = _getWeight(nft);
-            users[msg.sender].stakes.push(StakeInfo(nft, tokenId, block.timestamp));
-            users[msg.sender].weight += weight;
-            totalWeight += weight;
-            emit Staked(msg.sender, nft, tokenId, weight, block.timestamp);
+            users[msg.sender].stakes.push(StakeInfo(nft, tokenIds[i], block.timestamp));
+            totalAdd += weight;
         }
+        users[msg.sender].weight += totalAdd;
+        totalWeight += totalAdd;
         
         for (uint256 i = 0; i < nfts.length; i++) {
+            emit Staked(msg.sender, nfts[i], tokenIds[i]);
             IERC721(nfts[i]).safeTransferFrom(msg.sender, address(this), tokenIds[i]);
         }
     }
@@ -254,7 +256,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                     stakes[i] = stakes[len - 1];
                 }
                 stakes.pop();
-                emit Unstaked(msg.sender, nft, tokenId, weight, block.timestamp);
+                emit Unstaked(msg.sender, nft, tokenId);
                 
                 IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId);
                 return;
@@ -283,10 +285,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                     }
                     stakes.pop();
                     found = true;
-
-                    emit Unstaked(msg.sender, nft, tokenId, weight, block.timestamp);
+                    emit Unstaked(msg.sender, nft, tokenId);
                     IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId);
-                    
                     break;
                 }
             }
@@ -314,7 +314,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                 }
                 stakes.pop();
                 
-                emit Unstaked(msg.sender, nft, tid, weight, block.timestamp);
+                emit Unstaked(msg.sender, nft, tid);
                 IERC721(nft).safeTransferFrom(address(this), msg.sender, tid);
             }
         }
@@ -338,7 +338,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                 stakes[idx] = stakes[stakes.length - 1];
             }
             stakes.pop();
-            emit Unstaked(msg.sender, nftAddr, tid, weight, block.timestamp);
+            emit Unstaked(msg.sender, nftAddr, tid);
             IERC721(nftAddr).safeTransferFrom(address(this), msg.sender, tid);
         }
     }
@@ -352,7 +352,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         require(ptc.balanceOf(address(this)) >= reward, "Insufficient balance");
         u.pendingReward = 0;
         u.claimed += reward;
-        emit Claimed(msg.sender, reward, block.timestamp);
+        emit Claimed(msg.sender, reward);
         ptc.safeTransfer(msg.sender, reward);
     }
 
@@ -369,7 +369,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         u.claimed += amount;
 
         ptc.safeTransfer(msg.sender, amount); // 转移PTC到用户地址
-        emit Claimed(msg.sender, amount, block.timestamp); // 触发领取奖励事件
+        emit Claimed(msg.sender, amount); // 触发领取奖励事件
     }
         
     /// @notice 查询用户当前可领取的PTC奖励（包含未更新周期）
@@ -412,14 +412,14 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     function rescueERC20(address token, uint256 amount) external nonReentrant onlyOwner {
         require(token != address(ptc), "Cannot rescue PTC");
         require(token != address(0), "Zero address");
-        emit ERC20Rescued(msg.sender, token, amount, block.timestamp);
+        emit ERC20Rescued(msg.sender, token, amount);
         IERC20(token).safeTransfer(owner(), amount);
     }
 
     /// @notice 救援合约内误转入的主网币
     function rescueGAS(uint256 amount) external nonReentrant onlyOwner {
         require(amount <= address(this).balance, "Amount exceeds balance");
-        emit GASRescued(msg.sender, amount, block.timestamp);
+        emit GASRescued(msg.sender, amount);
         (bool success, ) = owner().call{value: amount}("");
         require(success, "Transfer failed");
     }
@@ -428,18 +428,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     function rescueERC721(address nft, uint256 tokenId) external nonReentrant onlyOwner {
         require(!_isSupportedNFT(nft), "Cannot rescue staked NFT");
         require(nft != address(0), "Zero address");
-        emit ERC721Rescued(msg.sender, nft, tokenId, block.timestamp);
+        emit ERC721Rescued(msg.sender, nft, tokenId);
         IERC721(nft).safeTransferFrom(address(this), owner(), tokenId);
-    }
-
-    /// @notice 奖励是否已经产完
-    function isProductionFinished() public view returns (bool) {
-        return block.timestamp >= endRewardTimestamp;
-    }
-
-    /// @notice 获取用户总产出（已领取 + 可领取）
-    function totalMined(address user) external view returns (uint256) {
-        return users[user].claimed + claimable(user);
     }
 
     /// @notice 紧急批量解押（仅暂停时可用，不结算奖励）
@@ -456,7 +446,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             totalWeight -= weight;
             users[msg.sender].weight -= weight;
             stakes.pop();
-            emit EmergencyUnstake(msg.sender, nftAddr, tid, block.timestamp);
+            emit EmergencyUnstake(msg.sender, nftAddr, tid);
             IERC721(nftAddr).safeTransferFrom(address(this), msg.sender, tid);
         }
         users[msg.sender].rewardDebt = accRewardPerWeight;
@@ -497,20 +487,17 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         require(amount > 0, "No fee");
         require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
         pendingFee = 0;
-        emit FeeClaimed(msg.sender, amount, block.timestamp); 
+        emit FeeClaimed(msg.sender, amount); 
         ptc.safeTransfer(feeRecipient, amount);
     }
 
     /// @notice 合约暂停（仅owner可调）
     function pause() external onlyOwner {
         _pause();
-        emit Paused(msg.sender, block.timestamp);
     }
 
     /// @notice 合约恢复（仅owner可调）
     function unpause() external onlyOwner {
         _unpause();
-        emit Unpaused(msg.sender, block.timestamp);
     }
-
 }
