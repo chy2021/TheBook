@@ -227,7 +227,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 totalAdd = 0;
         for (uint256 i = 0; i < nfts.length; i++) {
             address nft = nfts[i];
-            require(!_isSupportedNFT(nft), "Unsupported NFT");
+            require(_isSupportedNFT(nft), "Unsupported NFT");
             uint256 weight = _getWeight(nft);
             users[msg.sender].stakes.push(StakeInfo(nft, tokenIds[i], block.timestamp));
             totalAdd += weight;
@@ -459,6 +459,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     function proposeFeeChange(address _recipient, uint256 _rate) external onlyOwner {
         require(_rate <= 10000, "Fee too high");
         require(_recipient != address(0), "Zero address");
+        require(_recipient != feeRecipient || _rate != feeRate, "No change");
         require(pendingFeeRecipient != feeRecipient || pendingFeeRate != feeRate,"No change");
         // 只有最后一次 propose 的参数会生效
         pendingFeeRecipient = _recipient;
