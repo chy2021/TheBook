@@ -460,7 +460,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         require(_rate <= 10000, "Fee too high");
         require(_recipient != address(0), "Zero address");
         require(_recipient != feeRecipient || _rate != feeRate, "No change");
-        require(pendingFeeRecipient != feeRecipient || pendingFeeRate != feeRate,"No change");
+        require(_recipient != pendingFeeRecipient || _rate != pendingFeeRate,"No change");
         // 只有最后一次 propose 的参数会生效
         pendingFeeRecipient = _recipient;
         pendingFeeRate = _rate;
