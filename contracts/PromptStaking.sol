@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
-// NFT质押合约
-//
-// 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
-// 权重：Prompt=50，Memory=1，Memes=2500。
-// 产出速率:初始速率每10分钟产出160个PTC，按秒产出。
-// 减半周期:每两年产出速率减半。
-// 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出。
-// 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
-// 支持批量质押和解押NFT，支持同类型和不同类型的批量操作。
-// 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
 
 pragma solidity ^0.8.20;
 
@@ -24,7 +14,6 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 using SafeERC20 for IERC20;
 
 /// @title PromptStaking
-/// @notice 支持三种NFT的PTC奖励质押合约
 /// @author Thebook
 contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // -------------------- 质押结构体 --------------------
@@ -126,42 +115,29 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     // -------------------- 辅助查询函数 ------------------
-    /// @notice 获取用户所有质押NFT列表（不分页），如用户质押过多时导致不可用时，需使用分页查询函数
-    /// @param user 用户地址
-    /// @return stakes 用户所有质押NFT StakeInfo[]
-    function getStakedNFTsAll(address user) external view returns (StakeInfo[] memory stakes) {
-        return users[user].stakes;
-    }
-
     /// @notice 获取用户所有质押NFT列表（分页）
     /// @param user 用户地址
     /// @param offset 偏移量
     /// @param limit 限制数量
     /// @return stakes 用户所有质押NFT StakeInfo[]
-    function getStakedNFTsPaginated(address user, uint256 offset, uint256 limit) external view returns (StakeInfo[] memory stakes) {
+    function getStakedNFTs(address user, uint256 offset, uint256 limit) external view returns (StakeInfo[] memory stakes) {
         uint256 total = users[user].stakes.length;
         if (offset >= total) return new StakeInfo[](0);
         if (offset + limit > total) limit = total - offset;
-        stakes = new StakeInfo[](limit);
-        for (uint256 i = 0; i < limit; i++) {
-            stakes[i] = users[user].stakes[offset + i];
+        if (offset == 0 && limit == total) {
+            return users[user].stakes;
+        } else {
+            StakeInfo[] memory stakes = new StakeInfo[](limit);
+            for (uint256 i = 0; i < limit; i++) {
+                stakes[i] = users[user].stakes[offset + i];
+            }
+            return stakes;
         }
-        return stakes;
     }
 
     /// @notice 获取用户质押nft总数量
     function getStakedNFTsCount(address user) external view returns (uint256) {
         return users[user].stakes.length;
-    }
-    /// @notice 获取用户每种nft质押总数量
-    function getStakedNFTsCountByType(address user, address nft) external view returns (uint256) {
-        uint256 count = 0;
-        for (uint256 i = 0; i < users[user].stakes.length; i++) {
-            if (users[user].stakes[i].nft == nft) {
-                count++;
-            }
-        }
-        return count;
     }
 
     /// @notice 获取质押中的nft的所属用户
