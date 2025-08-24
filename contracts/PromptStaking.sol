@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
+// NFT质押合约
+//
+// 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
+// 权重：Prompt=50，Memory=1，Memes=2500。
+// 产出速率:初始速率每10分钟产出160个PTC，按秒产出。
+// 减半周期:每两年产出速率减半。
+// 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出。
+// 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
+// 支持批量质押和解押NFT，支持同类型和不同类型的批量操作。
+// 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
 
 pragma solidity ^0.8.20;
 
@@ -127,7 +137,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (offset == 0 && limit == total) {
             return users[user].stakes;
         } else {
-            StakeInfo[] memory stakes = new StakeInfo[](limit);
+            stakes = new StakeInfo[](limit);
             for (uint256 i = 0; i < limit; i++) {
                 stakes[i] = users[user].stakes[offset + i];
             }
@@ -425,18 +435,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             acc +=  (reward - fee) * 1e18 / totalWeight;
         }
         return u.pendingReward + (u.weight * (acc - u.rewardDebt) / 1e18);
-    }
-
-    /// @notice 分页获取用户质押NFT信息
-    function getStakedNFTs(address user, uint256 start, uint256 end) external view returns (StakeInfo[] memory) {
-        StakeInfo[] storage stakes = users[user].stakes;
-        require(start < end && end <= stakes.length, "Invalid range");
-        
-        StakeInfo[] memory result = new StakeInfo[](end - start);
-        for (uint256 i = start; i < end; i++) {
-            result[i - start] = stakes[i];
-        }
-        return result;
     }
 
     /// @notice 救援合约内误转入的ERC20代币（禁止PTC）
