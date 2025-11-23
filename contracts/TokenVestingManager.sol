@@ -1,50 +1,3 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/finance/VestingWallet.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "./MonthlyVesting.sol";
-
-/**
- * @title TokenVestingManager
- * @notice 管理针对 ERC20 的分配与 vesting 钱包创建。部署者/owner 负责把代币 approve 给本合约或直接从 owner 地址做 transferFrom。
- * 用法：部署后由 owner 调用 createVesting 或 createVestingBatch 为每个受益人创建 VestingWallet 并把代币转入；
- * 对于需要 TGE 时一次性发放的份额，可把 duration = 0，则直接转给受益人（不创建 VestingWallet）。
- */
-contract TokenVestingManager is Ownable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
-    IERC20 public immutable token;
-    uint256 public immutable tgeTimestamp;
-
-    struct VestingRecord {
-        address beneficiary;
-        address vestingWallet; // address(0) 表示直接转账（无 vesting）
-        uint256 amount;
-        uint64 start;
-        uint64 duration; // for linear VestingWallet (seconds), 0 for direct transfer or monthly
-        bool monthly; // 是否为按月等额分发
-        uint32 months; // 若 monthly==true 有效
-        uint64 monthSeconds; // 若 monthly==true 有效
-    }
-
-    VestingRecord[] public vestings;
-
-    event VestingCreated(
-        address indexed beneficiary,
-        address indexed vestingWallet,
-        uint256 amount,
-        uint256 start,
-        uint256 duration,
-        bool monthly,
-        uint32 months,
-        uint64 monthSeconds
-    );
-    event ERC20Rescued(address indexed operator, address token, address to, uint256 amount);
-    event DirectTransfer(address indexed beneficiary, uint256 amount);
 
     // SPDX-License-Identifier: MIT
     pragma solidity ^0.8.20;
@@ -238,28 +191,6 @@ contract TokenVestingManager is Ownable, ReentrancyGuard {
             emit ERC20Rescued(msg.sender, tokenAddr, to, amount);
         }
     }
-            if (vestings[i].beneficiary == beneficiary) {
-                count++;
-            }
-        }
-        uint256[] memory indices = new uint256[](count);
-        uint256 j = 0;
-        for (uint256 i = 0; i < n; i++) {
-            if (vestings[i].beneficiary == beneficiary) {
-                indices[j++] = i;
-            }
-        }
-        return indices;
-    }
+          
 
-    /**
-     * @notice rescue ERC20 mistakenly sent to this contract (cannot rescue the primary token)
-     */
-    function rescueERC20(address tokenAddr, address to, uint256 amount) external onlyOwner nonReentrant {
-        require(tokenAddr != address(token), "Cannot rescue main token");
-        require(to != address(0), "zero address");
-        IERC20(tokenAddr).safeTransfer(to, amount);
-        emit ERC20Rescued(msg.sender, tokenAddr, to, amount);
-    }
 
-}
