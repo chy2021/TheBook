@@ -4,19 +4,9 @@
 //
 // 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
 // 权重：Prompt=50，Memory=1，Memes=2500。
-// 废除的旧规则：产出速率:初始速率每10分钟产出160个PTC，按秒产出。减半周期:每两年产出速率减半。
-
-// 增加的新规则：
-// 质押挖矿的总数量：30亿
-// 总周期数量：共 6 个周期T1-T6，每个周期是2年，周期内线性释放，一共 12 年发完。
-// 周期T1 释放12亿
-// 周期T2 释放9亿 
-// 周期T3 释放4.5亿
-// 周期T4 释放2.25亿
-// 周期T5 释放1.125亿
-// 周期T6 释放1.125亿
-
-// 奖励采用全局积分累加器模型，近似连续产出。
+// 产出速率:初始速率每10分钟产出160个PTC，按秒产出。
+// 减半周期:每两年产出速率减半。
+// 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持批量质押和解押NFT，支持同类型和不同类型的批量操作。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
@@ -65,11 +55,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     address public immutable promptNFT;    // Prompt NFT合约地址
     address public immutable memesNFT;     // Memes NFT合约地址
 
-    // Reward schedule: 6 periods (T1..T6), each 2 years, linear release within each period.
-    uint256 public constant SCHEDULE_PERIODS = 6;
-    uint256 public constant SCHEDULE_PERIOD_DURATION = 2 * 365 days; // 2 years per period
-    // Total PTC to release per period (units: wei)
-    uint256[6] public schedulePeriodTotals;
+    uint256 public constant PERIOD_DURATION = 600;           // 初始奖励速率：时长(10分钟)
+    uint256 public constant INITIAL_REWARD = 160 ether;      // 初始奖励速率：额度(160PTC)
+    uint256 public constant HALVING_INTERVAL = 2 * 365 days; // 每两年速率减半
+    uint256 public constant PRODUCTION_DURATION = 364896000; // 总产出时长364896000秒
 
     uint256 public startRewardTimestamp; // 奖励产出起始时间
     uint256 public endRewardTimestamp;   // 奖励产出结束时间
@@ -132,17 +121,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             require(_startTime >= block.timestamp, "StartTime must be in the future");
             startRewardTimestamp = _startTime;
         }
-        // Set end timestamp to cover all schedule periods (6 * 2 years = 12 years)
-        endRewardTimestamp = startRewardTimestamp + SCHEDULE_PERIODS * SCHEDULE_PERIOD_DURATION;
-
-        // Initialize schedule totals (单位: 亿 = 100,000,000)
-        // T1: 12亿, T2: 9亿, T3: 4.5亿, T4: 2.25亿, T5: 1.125亿, T6: 1.125亿
-        schedulePeriodTotals[0] = 1200000000 ether; // 12亿
-        schedulePeriodTotals[1] = 900000000 ether;  // 9亿
-        schedulePeriodTotals[2] = 450000000 ether;  // 4.5亿
-        schedulePeriodTotals[3] = 225000000 ether;  // 2.25亿
-        schedulePeriodTotals[4] = 112500000 ether;  // 1.125亿
-        schedulePeriodTotals[5] = 112500000 ether;  // 1.125亿
+        endRewardTimestamp = startRewardTimestamp + PRODUCTION_DURATION;
     }
 
     // -------------------- 辅助查询函数 ------------------
@@ -207,31 +186,24 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         }
         uint256 from = lastRewardTimestamp;
         uint256 to = nowTime;
-
-        // Compute total emitted up to 'to' and up to 'from', then take difference.
-        uint256 reward = _emittedUntil(to) - _emittedUntil(from);
+        uint256 reward = 0;
+        while (from < to) {
+            // 当前from所在的减半区间的结束时间
+            uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
+            uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
+            if (halvingEnd > to) halvingEnd = to;
+            uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
+            uint256 duration = halvingEnd - from;
+            // 直接累加这段时间的奖励
+            reward += rewardPerPeriod * duration / PERIOD_DURATION;
+            from = halvingEnd;
+        }
         // 计算本次应收手续费
         uint256 fee = reward * feeRate / 1e4;
         pendingFee += fee;
         // 分配给用户
         accRewardPerWeight += (reward - fee) * 1e18 / totalWeight;
         lastRewardTimestamp = nowTime;
-    }
-
-    /// @notice Returns total amount emitted from schedule start up to time `t` 
-    function _emittedUntil(uint256 t) internal view returns (uint256) {
-        if (t <= startRewardTimestamp) return 0;
-        if (t > endRewardTimestamp) t = endRewardTimestamp;
-        uint256 total = 0;
-        uint256 periodDuration = SCHEDULE_PERIOD_DURATION;
-        for (uint256 i = 0; i < SCHEDULE_PERIODS; i++) {
-            uint256 periodStart = startRewardTimestamp + i * periodDuration;
-            if (t <= periodStart) break;
-            uint256 periodEnd = periodStart + periodDuration;
-            uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
-            total += schedulePeriodTotals[i] * elapsed / periodDuration;
-        }
-        return total;
     }
 
     /// @notice 更新指定用户的奖励（全局积分累加器模型）
@@ -447,16 +419,22 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
         uint256 acc = accRewardPerWeight;
         if (nowTime > lastRewardTimestamp && totalWeight > 0) {
-            uint256 reward = _emittedUntil(nowTime) - _emittedUntil(lastRewardTimestamp);
+            uint256 from = lastRewardTimestamp;
+            uint256 to = nowTime;
+            uint256 reward = 0;
+            while (from < to) {
+                uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
+                uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
+                if (halvingEnd > to) halvingEnd = to;
+                uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
+                uint256 duration = halvingEnd - from;
+                reward += rewardPerPeriod * duration / PERIOD_DURATION;
+                from = halvingEnd;
+            }
             uint256 fee = reward * feeRate / 1e4;
-            acc += (reward - fee) * 1e18 / totalWeight;
+            acc +=  (reward - fee) * 1e18 / totalWeight;
         }
         return u.pendingReward + (u.weight * (acc - u.rewardDebt) / 1e18);
-    }
-
-    /// @notice Public view of total emitted tokens up to time `t` (t clipped to schedule end).
-    function emittedUntil(uint256 t) external view returns (uint256) {
-        return _emittedUntil(t);
     }
 
     /// @notice 救援合约内误转入的ERC20代币（禁止PTC）
