@@ -11,6 +11,17 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
  *         monthly portions and allows anyone to trigger distribution to the
  *         beneficiary.
  *
+ * @dev Compatibility note: this contract assumes the vesting token transfers
+ *      1:1 (no transfer fees or burns). For production we recommend using
+ *      non-deflationary ERC20 tokens (no fee-on-transfer or burn mechanics).
+ *
+ *      When a deflationary token is used, the contract protects itself by
+ *      only releasing months that can be fully funded with the current token
+ *      balance (see `releasableAmount()` / `payableMonths()`). If the balance
+ *      is insufficient to fully pay any available month, `release()` will
+ *      revert with `insufficient funds for any month` to avoid partial
+ *      payouts and inconsistent on-chain accounting.
+ *
  * Design notes:
  *  - `start` is the timestamp when the first month's portion becomes claimable.
  *  - Each call to `release()` transfers the accumulated, currently claimable
@@ -18,6 +29,12 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
  */
 contract MonthlyVesting is ReentrancyGuard {
     using SafeERC20 for IERC20;
+
+    /// Upper bound to avoid unbounded loops and excessive gas costs when
+    /// iterating months in `releasableAmount()` / `release()`.
+    /// This is intentionally large (1200 months = 100 years) but provides a
+    /// practical guard against accidental or maliciously large `months` values.
+    uint32 public constant MAX_MONTHS = 1200;
 
     IERC20 public immutable token;
     address public immutable beneficiary;
@@ -54,7 +71,8 @@ contract MonthlyVesting is ReentrancyGuard {
         require(_start > 0, "start must be > 0");
         require(_beneficiary != address(0), "beneficiary is zero");
         require(_monthSeconds > 0, "monthSeconds is zero");
-        require(_months > 0, "months is zero");
+            require(_months > 0, "months is zero");
+            require(_months <= MAX_MONTHS, "months exceeds max allowed");
         require(_totalAmount > 0, "amount is zero");
 
         token = _token;
@@ -64,8 +82,11 @@ contract MonthlyVesting is ReentrancyGuard {
         months = _months;
         totalAmount = _totalAmount;
 
+        // Compute per-month floor amount and exact remainder.
+        // Use modulo to compute the remainder directly to avoid any
+        // precision confusion from integer truncation in division.
         monthlyAmount = _totalAmount / _months;
-        remainder = _totalAmount - (monthlyAmount * _months);
+        remainder = _totalAmount % uint256(_months);
         releasedMonths = 0;
     }
 
@@ -81,13 +102,31 @@ contract MonthlyVesting is ReentrancyGuard {
 
     /// @notice Amount currently claimable (aggregated across available months).
     function releasableAmount() public view returns (uint256) {
+        // Compute how many of the currently available monthly portions can be
+        // fully funded with the current token balance of this contract. This
+        // avoids a situation where `release()` would attempt to transfer more
+        // tokens than the contract actually holds (e.g., because of deflationary
+        // tokens or prior burns), which would revert and permanently block
+        // further releases.
         uint32 avail = _availableMonths();
         if (avail == 0) return 0;
-        uint256 amount = uint256(avail) * monthlyAmount;
-        uint32 willBeReleased = releasedMonths + avail;
-        // If this release includes the final month, include the remainder.
-        if (willBeReleased == months && remainder > 0) {
-            amount += remainder;
+
+        uint256 bal = token.balanceOf(address(this));
+        uint256 amount = 0;
+        uint32 curReleased = releasedMonths;
+
+        for (uint32 i = 0; i < avail; i++) {
+            uint32 willBeReleased = curReleased + i + 1;
+            uint256 thisPortion = monthlyAmount;
+            if (willBeReleased == months && remainder > 0) {
+                thisPortion += remainder;
+            }
+            if (bal >= thisPortion) {
+                amount += thisPortion;
+                bal -= thisPortion;
+            } else {
+                break;
+            }
         }
         return amount;
     }
@@ -117,20 +156,61 @@ contract MonthlyVesting is ReentrancyGuard {
     function release() external nonReentrant returns (uint256) {
         uint32 avail = _availableMonths();
         require(avail > 0, "nothing releasable");
-        uint256 amount = uint256(avail) * monthlyAmount;
-        uint32 willBeReleased = releasedMonths + avail;
-        if (willBeReleased == months && remainder > 0) {
-            amount += remainder;
+
+        uint256 bal = token.balanceOf(address(this));
+        uint256 amount = 0;
+        uint32 monthsToRelease = 0;
+        uint32 curReleased = releasedMonths;
+
+        // Iterate month-by-month and aggregate only fully-funded portions.
+        for (uint32 i = 0; i < avail; i++) {
+            uint32 willBeReleased = curReleased + i + 1;
+            uint256 thisPortion = monthlyAmount;
+            if (willBeReleased == months && remainder > 0) {
+                thisPortion += remainder;
+            }
+            if (bal >= thisPortion) {
+                amount += thisPortion;
+                bal -= thisPortion;
+                monthsToRelease++;
+            } else {
+                break;
+            }
         }
 
+        require(monthsToRelease > 0, "insufficient funds for any month");
+
         // Effects: update bookkeeping before external transfer.
-        releasedMonths = willBeReleased;
+        releasedMonths = releasedMonths + monthsToRelease;
 
         // Interactions: transfer tokens to beneficiary.
         token.safeTransfer(beneficiary, amount);
 
         emit Released(beneficiary, amount, releasedMonths);
         return amount;
+    }
+
+    /// @notice How many of the available months can be fully paid with current balance.
+    function payableMonths() external view returns (uint32) {
+        uint32 avail = _availableMonths();
+        if (avail == 0) return 0;
+        uint256 bal = token.balanceOf(address(this));
+        uint32 curReleased = releasedMonths;
+        uint32 monthsPayable = 0;
+        for (uint32 i = 0; i < avail; i++) {
+            uint32 willBeReleased = curReleased + i + 1;
+            uint256 thisPortion = monthlyAmount;
+            if (willBeReleased == months && remainder > 0) {
+                thisPortion += remainder;
+            }
+            if (bal >= thisPortion) {
+                bal -= thisPortion;
+                monthsPayable++;
+            } else {
+                break;
+            }
+        }
+        return monthsPayable;
     }
 
     /// @notice Balance remaining in this vesting contract.

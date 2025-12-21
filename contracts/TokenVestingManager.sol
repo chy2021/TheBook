@@ -15,6 +15,12 @@ import "./MonthlyVesting.sol";
  *         vestings. This manager supports direct one-time transfers and monthly equal
  *         vestings (MonthlyVesting). Linear OZ VestingWallet usage is retained for
  *         backward compatibility but can be deprecated if desired.
+ *
+ * @dev Compatibility note: prefer non-deflationary ERC20 tokens (no transfer
+ *      fees or burn-on-transfer) for production use. For direct transfers the
+ *      manager measures the recipient's balance change and will revert if the
+ *      beneficiary receives less than the requested amount (to avoid
+ *      inconsistent on-chain accounting). 
  */
 contract TokenVestingManager is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -47,9 +53,10 @@ contract TokenVestingManager is Ownable, ReentrancyGuard {
     );
     event ERC20Rescued(address indexed operator, address token, address to, uint256 amount);
     event DirectTransfer(address indexed beneficiary, uint256 amount);
+    /// Emitted when a vesting record is removed from storage.
+    event VestingRemoved(uint256 indexed index, address indexed beneficiary, address vestingWallet, uint256 amount);
 
     /**
-     * @param _token ERC20 token used for vesting
      * @param _tgeTimestamp timestamp of TGE (seconds). If zero, uses deployment time.
      */
     constructor(IERC20 _token, uint256 _tgeTimestamp) Ownable(msg.sender) {
@@ -83,15 +90,18 @@ contract TokenVestingManager is Ownable, ReentrancyGuard {
         require(amount > 0, "amount is zero");
 
         uint256 start256 = tgeTimestamp + cliffSeconds;
+        // Guard against overflow/truncation when casting to uint64 below.
+        require(start256 <= type(uint64).max, "start timestamp overflow");
         uint64 start = uint64(start256);
 
         if (monthly) {
             require(months > 0, "months is zero");
+            // (Note: no upper bound enforced here; MonthlyVesting enforces
+            // its own MAX_MONTHS limit at construction time.)
             require(monthSeconds > 0, "monthSeconds is zero");
-            // Deploy MonthlyVesting and record the vesting first (checks -> effects)
+            // Deploy MonthlyVesting (checks -> effects). We will fund it next
+            // and then record the *actual* received amount for accurate bookkeeping.
             MonthlyVesting mv = new MonthlyVesting(token, beneficiary, start, monthSeconds, months, amount);
-            vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(mv), amount: amount, start: start, duration: 0, monthly: true, months: months, monthSeconds: monthSeconds }));
-            emit VestingCreated(beneficiary, address(mv), amount, start, 0, true, months, monthSeconds);
 
             // Transfer funds to the new vesting contract (interactions)
             if (token.balanceOf(address(this)) >= amount) {
@@ -100,36 +110,57 @@ contract TokenVestingManager is Ownable, ReentrancyGuard {
                 token.safeTransferFrom(msg.sender, address(mv), amount);
             }
 
-            // Strict check to detect fee-on-transfer tokens.
-            require(token.balanceOf(address(mv)) == amount, "vesting received incorrect amount");
+            // Record the actual balance held by the child vesting contract
+            // after funding. This makes on-chain bookkeeping accurate even
+            // when tokens are deflationary or fees are applied during transfer.
+            uint256 finalBalMv = token.balanceOf(address(mv));
+            require(finalBalMv > 0, "vesting received insufficient amount");
+
+            vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(mv), amount: finalBalMv, start: start, duration: 0, monthly: true, months: months, monthSeconds: monthSeconds }));
+            emit VestingCreated(beneficiary, address(mv), finalBalMv, start, 0, true, months, monthSeconds);
             return;
         }
 
         if (durationSeconds == 0) {
-            // Direct one-time transfer: record first, then transfer.
-            vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(0), amount: amount, start: start, duration: 0, monthly: false, months: 0, monthSeconds: 0 }));
-            emit DirectTransfer(beneficiary, amount);
+            // Direct one-time transfer: perform the transfer first, measure the
+            // beneficiary's balance delta, and record the actual received amount.
+            uint256 beforeBal = token.balanceOf(beneficiary);
             if (token.balanceOf(address(this)) >= amount) {
                 token.safeTransfer(beneficiary, amount);
             } else {
                 token.safeTransferFrom(msg.sender, beneficiary, amount);
             }
+            uint256 afterBal = token.balanceOf(beneficiary);
+            require(afterBal >= beforeBal, "balance underflow");
+            uint256 received = afterBal - beforeBal;
+
+            // Ensure the beneficiary actually received the intended funds.
+            // If the token is deflationary (fee-on-transfer) this will revert
+            // and prevent inaccurate on-chain accounting.
+            require(received >= amount, "recipient received insufficient amount");
+
+            // Record the actual received amount to keep on-chain accounting accurate.
+            vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(0), amount: received, start: start, duration: 0, monthly: false, months: 0, monthSeconds: 0 }));
+            emit DirectTransfer(beneficiary, received);
             return;
         }
 
         // Linear vesting path (uses OZ VestingWallet). Retained for backward compatibility.
         VestingWallet vw = new VestingWallet(beneficiary, start, uint64(durationSeconds));
 
-        vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(vw), amount: amount, start: start, duration: uint64(durationSeconds), monthly: false, months: 0, monthSeconds: 0 }));
-        emit VestingCreated(beneficiary, address(vw), amount, start256, durationSeconds, false, 0, 0);
-
+        // Transfer funds to the VestingWallet and then record the actual
+        // balance held by the child vesting contract for accurate bookkeeping.
         if (token.balanceOf(address(this)) >= amount) {
             token.safeTransfer(address(vw), amount);
         } else {
             token.safeTransferFrom(msg.sender, address(vw), amount);
         }
 
-        require(token.balanceOf(address(vw)) == amount, "vesting received incorrect amount");
+        uint256 finalBalVw = token.balanceOf(address(vw));
+        require(finalBalVw > 0, "vesting received insufficient amount");
+
+        vestings.push(VestingRecord({ beneficiary: beneficiary, vestingWallet: address(vw), amount: finalBalVw, start: start, duration: uint64(durationSeconds), monthly: false, months: 0, monthSeconds: 0 }));
+        emit VestingCreated(beneficiary, address(vw), finalBalVw, start256, durationSeconds, false, 0, 0);
     }
 
     /// @notice Create a single vesting entry (only callable by owner).
@@ -173,6 +204,41 @@ contract TokenVestingManager is Ownable, ReentrancyGuard {
     function vestingAt(uint256 idx) external view returns (VestingRecord memory) {
         require(idx < vestings.length, "index out of range");
         return vestings[idx];
+    }
+
+    /**
+     * @notice Returns true when the vesting at `idx` can be safely removed.
+     *         A vesting is removable when it does not hold any tokens anymore.
+     */
+    function canRemoveVesting(uint256 idx) public view returns (bool) {
+        if (idx >= vestings.length) return false;
+        VestingRecord storage r = vestings[idx];
+        // Direct transfers have no vesting contract and are safe to remove.
+        if (r.vestingWallet == address(0)) return true;
+        // If the vesting contract (MonthlyVesting or VestingWallet) holds zero tokens,
+        // it is safe to remove the record.
+        return token.balanceOf(r.vestingWallet) == 0;
+    }
+
+    /**
+     * @notice Remove a vesting record from storage when it no longer holds funds.
+     * @dev Owner only. Performs a swap-with-last + pop to keep gas costs predictable.
+     */
+    function removeVesting(uint256 idx) external onlyOwner nonReentrant {
+        require(idx < vestings.length, "index out of range");
+        require(canRemoveVesting(idx), "vesting not removable");
+        _removeVestingAt(idx);
+    }
+
+    function _removeVestingAt(uint256 idx) internal {
+        uint256 last = vestings.length - 1;
+        VestingRecord memory removed = vestings[idx];
+        if (idx != last) {
+            // Move the last element into the slot being removed.
+            vestings[idx] = vestings[last];
+        }
+        vestings.pop();
+        emit VestingRemoved(idx, removed.beneficiary, removed.vestingWallet, removed.amount);
     }
 
     /**

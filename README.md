@@ -106,6 +106,15 @@ Don't forget to give the project a star! Thanks again!
 1. `npm install`
 2. `npm run test`
 
+---
+
+## Vesting token compatibility (重要兼容性说明)
+
+本仓库包含用于代币锁仓与分发的合约（例如 `TokenVestingManager` 与 `MonthlyVesting`）。**强烈建议**在生产环境中仅使用 **非手续费/非燃烧（non-deflationary）ERC20** 作为锁仓/分发代币。
+
+更详细的兼容性说明和运行时行为请参阅：`docs/vesting-compatibility.md`。
+注意：`TokenVestingManager` 在为子合约充值后会记录子合约的**实际到账余额**作为 `VestingRecord.amount`（并在事件中报告实际到账），以便在费率型代币场景中提供准确的运维视图。
+
 <!-- LICENSE -->
 
 ## License
