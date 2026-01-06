@@ -4,9 +4,6 @@
 //
 // 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
 // 权重：Prompt=50，Memory=1，Memes=2500。
-// 废除的旧规则：产出速率:初始速率每10分钟产出160个PTC，按秒产出。减半周期:每两年产出速率减半。
-
-// 增加的新规则：
 // 质押挖矿的总数量：30亿
 // 总周期数量：共 6 个周期T1-T6，每个周期是2年，周期内线性释放，一共 12 年发完。
 // 周期T1 释放12亿
@@ -15,6 +12,7 @@
 // 周期T4 释放2.25亿
 // 周期T5 释放1.125亿
 // 周期T6 释放1.125亿
+// 提现限制：从整体生息开始时间之后的t时间内，用户最多只能提取x比例。t时间外，用户可以提取全部。t和x在构造函数中设置。
 
 // 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
@@ -78,6 +76,12 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public lastRewardTimestamp;  // 上次奖励计算时间戳
     uint256 public totalWeight;          // 全局总权重（所有用户权重之和）
 
+    // -------------------- 提现限制 --------------------
+    // 限制定义：从全局奖励开始时间 `startRewardTimestamp` 开始的前 `withdrawalLimitDuration` 秒内，
+    // 用户每次最多可提取其 `pendingReward` 的 `withdrawalLimitRate/10000`；在该限制期之后，用户可以提取全部。
+    uint256 public withdrawalLimitDuration; // 提现限制窗口，单位秒（相对于 `startRewardTimestamp`）
+    uint256 public withdrawalLimitRate;     // 允许在窗口内提取的最大比例，单位1e4（10000=100%）
+
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
     uint256 public feeRate;      // 手续费率，单位1e4（100=1%）
@@ -107,25 +111,35 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @param _memesNFT Memes NFT地址
     /// @param _startTime 奖励产出起始时间（0为立即开始）
     /// @param _feeRecipient 手续费接收地址
+    /// @param _withdrawalLimitDuration 提现限制窗口，单位秒（相对于 `startRewardTimestamp`）
+    /// @param _withdrawalLimitRate 提现限制内允许提取比例，单位1e4（10000=100%）
     constructor(
         address _ptc,
         address _memoryNFT,
         address _promptNFT,
         address _memesNFT,
         uint256 _startTime,
-        address _feeRecipient
+        address _feeRecipient,
+        uint256 _withdrawalLimitDuration,
+        uint256 _withdrawalLimitRate // in 1e4, 10000 == 100%
     ) Ownable(msg.sender) {
         require(_ptc != address(0), "address zero");
         require(_memoryNFT != address(0), "address zero");
         require(_promptNFT != address(0), "address zero");
         require(_memesNFT != address(0), "address zero");
         require(_feeRecipient != address(0), "address zero");
+        require(_withdrawalLimitRate <= 10000, "Invalid withdrawal rate");
 
         ptc = IERC20(_ptc);
         memoryNFT = _memoryNFT;
         promptNFT = _promptNFT;
         memesNFT = _memesNFT;
         feeRecipient = _feeRecipient;
+
+        // 初始化提现限制
+        withdrawalLimitDuration = _withdrawalLimitDuration;
+        withdrawalLimitRate = _withdrawalLimitRate;
+
         if (_startTime == 0) {
             startRewardTimestamp = block.timestamp;
         } else {
@@ -176,6 +190,44 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         return nftOwners[nft][tokenId];
     }
 
+    /// @notice 获取用户概览信息，便于链下一次性读取常用字段
+    /// @param user 用户地址
+    /// @return stakeCount 质押项数量
+    /// @return weight 总权重
+    /// @return claimableAmount 当前可领取（包含未写入 pending 的部分）
+    /// @return claimed 已累计领取总量
+    function getUserSummary(address user) external view returns (uint256 stakeCount, uint256 weight, uint256 claimableAmount, uint256 claimed) {
+        stakeCount = users[user].stakes.length;
+        weight = users[user].weight;
+        claimableAmount = claimable(user);
+        claimed = users[user].claimed;
+    }
+
+    /// @notice 获取提现限制配置信息及当前是否处于限制期
+    /// @return duration 限制期时长
+    /// @return rate 限制内允许提取比例，单位 1e4（10000 == 100%）
+    /// @return restricted 当前是否仍在限制期
+    function getWithdrawalLimitInfo() external view returns (uint256 duration, uint256 rate, bool restricted) {
+        duration = withdrawalLimitDuration;
+        rate = withdrawalLimitRate;
+        // 仅在 startRewardTimestamp 至 startRewardTimestamp + duration 之间视为限制期
+        restricted = (duration != 0 && block.timestamp >= startRewardTimestamp && block.timestamp < startRewardTimestamp + duration);
+    }
+
+    /// @notice 获取合约关键全局统计信息，便于链下监控
+    /// @return _totalWeight 全局总权重
+    /// @return _accRewardPerWeight 全局 accRewardPerWeight
+    /// @return _lastRewardTimestamp 上次奖励计算时间戳
+    /// @return _startRewardTimestamp 奖励开始时间戳
+    /// @return _endRewardTimestamp 奖励结束时间戳
+    function getSystemStats() external view returns (uint256 _totalWeight, uint256 _accRewardPerWeight, uint256 _lastRewardTimestamp, uint256 _startRewardTimestamp, uint256 _endRewardTimestamp) {
+        _totalWeight = totalWeight;
+        _accRewardPerWeight = accRewardPerWeight;
+        _lastRewardTimestamp = lastRewardTimestamp;
+        _startRewardTimestamp = startRewardTimestamp;
+        _endRewardTimestamp = endRewardTimestamp;
+    }
+
     // -------------------- 核心函数 --------------------
     /// @notice 修饰符：检查NFT是否为支持的三种NFT之一
     modifier onlySupportedNFT(address nft) {
@@ -219,7 +271,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice Returns total amount emitted from schedule start up to time `t` 
-    function _emittedUntil(uint256 t) internal view returns (uint256) {
+    function _emittedUntil(uint256 t) public view returns (uint256) {
         if (t <= startRewardTimestamp) return 0;
         if (t > endRewardTimestamp) t = endRewardTimestamp;
         uint256 total = 0;
@@ -244,6 +296,38 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             u.pendingReward += pending;
         }
         u.rewardDebt = accRewardPerWeight;
+    }
+
+    /// @notice 内部函数：计算在当前提现限制下，用户最多可领取的数量
+    /// 注意，调用本函数前，须确保刚执行过_updateReward(msg.sender)以同步用户的 u.pendingReward
+    function _allowedClaimAmount(UserInfo storage u) internal view returns (uint256) {
+        uint256 totalPending = u.pendingReward;
+        if (withdrawalLimitDuration == 0) return totalPending;
+        // 如果不在限制窗口内：可以提取全部
+        if (block.timestamp >= startRewardTimestamp + withdrawalLimitDuration) {
+            return totalPending;
+        }
+        // 基数包含用户已累计领走的数量与当前可领取的数量（即“已提取 + 待提取”）
+        uint256 baseTotal = u.claimed + totalPending; // 包含历史已领取 + 当前可领
+        uint256 allowedTotal = baseTotal * withdrawalLimitRate / 1e4;
+        if (allowedTotal <= u.claimed) return 0;
+        uint256 remaining = allowedTotal - u.claimed;
+        return totalPending <= remaining ? totalPending : remaining;
+    }
+
+    /// @notice 查询在提现限制下用户当前允许领取的数量
+    /// @dev 基数为 `已累计领取 (u.claimed)` + `当前可领取 (claimable(user))`。
+    function allowedClaimable(address user) external view returns (uint256) {
+        uint256 total = claimable(user);
+        UserInfo storage u = users[user];
+        if (withdrawalLimitDuration == 0) return total;
+        // 如果不在限制窗口期：可以提取全部
+        if (block.timestamp >= startRewardTimestamp + withdrawalLimitDuration) return total;
+        uint256 baseTotal = u.claimed + total;
+        uint256 allowedTotal = baseTotal * withdrawalLimitRate / 1e4;
+        if (allowedTotal <= u.claimed) return 0;
+        uint256 remain = allowedTotal - u.claimed;
+        return remain <= total ? remain : total;
     }
 
     // ========== 质押解押相关 ==========
@@ -416,13 +500,22 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     function claim() external nonReentrant whenNotPaused {
         _updateReward(msg.sender);
         UserInfo storage u = users[msg.sender];
-        uint256 reward = u.pendingReward;
-        require(reward > 0, "No claimable reward");
-        require(ptc.balanceOf(address(this)) >= reward, "Insufficient balance");
-        u.pendingReward = 0;
-        u.claimed += reward;
-        emit Claimed(msg.sender, reward);
-        ptc.safeTransfer(msg.sender, reward);
+        // 使用 claimable() 作为权威的可领取值（包含未写入 pending 的部分）
+        uint256 totalPending = u.pendingReward;
+        require(totalPending > 0, "No claimable reward");
+
+        uint256 allowed = _allowedClaimAmount(u);
+        require(allowed > 0, "Claim amount limited to zero");
+
+        uint256 amountToClaim = totalPending <= allowed ? totalPending : allowed;
+        require(ptc.balanceOf(address(this)) >= amountToClaim, "Insufficient balance");
+
+        // 扣减用户 pending（_updateReward 已保证 u.pendingReward 与 claimable 一致）
+        u.pendingReward -= amountToClaim;
+        u.claimed += amountToClaim;
+
+        emit Claimed(msg.sender, amountToClaim);
+        ptc.safeTransfer(msg.sender, amountToClaim);
     }
 
     /// @notice 领取指定数量的PTC奖励
@@ -431,7 +524,12 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         UserInfo storage u = users[msg.sender];
 
         require(amount > 0, "Amount must be greater than zero");
-        require(amount <= u.pendingReward, "Amount exceeds claimable reward");
+        // 使用 claimable() 作为权威的可领取值
+        uint256 totalPending = claimable(msg.sender);
+        require(amount <= totalPending, "Amount exceeds claimable reward");
+
+        uint256 allowed = _allowedClaimAmount(u);
+        require(amount <= allowed, "Amount exceeds allowed claim limit");
         require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
 
         u.pendingReward -= amount;
