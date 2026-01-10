@@ -12,7 +12,7 @@
 // 周期T4 释放2.25亿
 // 周期T5 释放1.125亿
 // 周期T6 释放1.125亿
-// 提现限制：从整体生息开始时间之后的t时间内，用户最多只能提取x比例。t时间外，用户可以提取全部。t和x在构造函数中设置。
+// 提现限制：从整体生息开始时间之后的t时间内，用户最多只能提取x比例。t时间外，用户可以提取全部。。
 
 // 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
@@ -79,8 +79,13 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // -------------------- 提现限制 --------------------
     // 限制定义：从全局奖励开始时间 `startRewardTimestamp` 开始的前 `withdrawalLimitDuration` 秒内，
     // 用户每次最多可提取其 `pendingReward` 的 `withdrawalLimitRate/10000`；在该限制期之后，用户可以提取全部。
-    uint256 public withdrawalLimitDuration; // 提现限制窗口，单位秒（相对于 `startRewardTimestamp`）
-    uint256 public withdrawalLimitRate;     // 允许在窗口内提取的最大比例，单位1e4（10000=100%）
+    uint256 public withdrawalLimitDuration; // 提现限制时间，单位秒（相对于 `startRewardTimestamp`）
+    uint256 public withdrawalLimitRate;     // 允许在限制时间内提取的最大比例，单位1e4（10000=100%）
+    
+    uint256 public pendingWithdrawalLimitDuration; // 待变更的提现限制时间
+    uint256 public pendingWithdrawalLimitRate;     // 待变更的提现限制比例
+    uint256 public withdrawalLimitChangeTime;      // 提现限制变更时间锁
+    uint256 public constant WITHDRAWAL_CHANGE_DELAY = 1 days;// 提现限制变更时间锁延迟（1天）
 
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
@@ -103,7 +108,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event FeeRateProposed(address indexed proposer, address newRecipient, uint256 newRate, uint256 executeTime);
     event FeeRateChanged(address indexed executor, address newRecipient, uint256 newRate);
     event FeeClaimed(address indexed recipient, uint256 amount);
-
+    event WithdrawalLimitProposed(address indexed proposer, uint256 newDuration, uint256 newRate, uint256 executeTime);
+    event WithdrawalLimitChanged(address indexed executor, uint256 newDuration, uint256 newRate);
+    
+    // -------------------- 构造函数 --------------------
     /// @notice 构造函数，初始化PTC和NFT合约地址及奖励起始时间
     /// @param _ptc PTC代币地址
     /// @param _memoryNFT Memory NFT地址
@@ -672,6 +680,32 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         pendingFee = 0;
         emit FeeClaimed(msg.sender, amount); 
         ptc.safeTransfer(feeRecipient, amount);
+    }
+
+    /// @notice 提议变更提现限制参数
+    /// @param _duration 提现限制时间，单位秒（相对于 `startRewardTimestamp`）
+    /// @param _rate 提现限制内允许提取比例，单位1e4（10000=100%）  
+    function proposeWithdrawalLimitChange(uint256 _duration, uint256 _rate) external onlyOwner {
+        require(_rate <= 10000, "Invalid withdrawal rate");
+        require(_duration != withdrawalLimitDuration || _rate != withdrawalLimitRate, "No change");
+        require(_duration != pendingWithdrawalLimitDuration || _rate != pendingWithdrawalLimitRate, "No change");
+        pendingWithdrawalLimitDuration = _duration;
+        pendingWithdrawalLimitRate = _rate;
+        withdrawalLimitChangeTime = block.timestamp + WITHDRAWAL_CHANGE_DELAY;
+        emit WithdrawalLimitProposed(msg.sender, _duration, _rate, withdrawalLimitChangeTime);
+    }
+
+    /// @notice 提现限制变更时间锁，单位秒
+    function applyWithdrawalLimitChange() external onlyOwner {
+        require(withdrawalLimitChangeTime > 0 && block.timestamp >= withdrawalLimitChangeTime, "Not ready");
+        require(pendingWithdrawalLimitDuration != withdrawalLimitDuration || pendingWithdrawalLimitRate != withdrawalLimitRate, "No change");
+        withdrawalLimitDuration = pendingWithdrawalLimitDuration;
+        withdrawalLimitRate = pendingWithdrawalLimitRate;
+        emit WithdrawalLimitChanged(msg.sender, withdrawalLimitDuration, withdrawalLimitRate);
+        // 清空pending
+        withdrawalLimitChangeTime = 0;
+        pendingWithdrawalLimitDuration = 0;
+        pendingWithdrawalLimitRate = 0;
     }
 
     /// @notice 合约暂停（仅owner可调）
