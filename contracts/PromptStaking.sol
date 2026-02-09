@@ -125,7 +125,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         address _feeRecipient,
         uint256 _withdrawalLimitDuration,
         uint256 _withdrawalLimitRate // in 1e4, 10000 == 100%
-    ) {
+    ) Ownable(msg.sender)
+    {
         require(_ptc != address(0), "address zero");
         require(_promptNFT != address(0), "address zero");
         require(_feeRecipient != address(0), "address zero");
