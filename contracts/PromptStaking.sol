@@ -191,19 +191,22 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     // -------------------- 辅助查询函数 ------------------
+    /// @dev 计算当前销售比例（不修改状态）
+    /// @return 销售比例（1e18精度）
+    function _computeProtectedSalesRatio() internal view returns (uint256) {
+        uint256 sold = totalNFTSupply - IERC721(promptNFT).balanceOf(salesAddress);
+        uint256 rawRatio = sold * 1e18 / totalNFTSupply;
+        return rawRatio > maxSalesRatio ? maxSalesRatio : rawRatio;
+    }
+
     /// @notice 获取受保护的销售比例（带缓存、上限保护和紧急暂停）
     /// @return 销售比例（1e18精度）
     function getProtectedSalesRatio() public returns (uint256) {
-        // 如果紧急暂停，使用缓存值
         if (salesRatioUpdatePaused) {
             return cachedSalesRatio;
         }
-        // 每小时最多更新一次销售比例
         if (block.timestamp - lastSalesRatioUpdate >= 1 hours) {
-            uint256 sold = totalNFTSupply - IERC721(promptNFT).balanceOf(salesAddress);
-            uint256 rawRatio = sold * 1e18 / totalNFTSupply;
-            // 应用最大上限保护
-            cachedSalesRatio = rawRatio > maxSalesRatio ? maxSalesRatio : rawRatio;
+            cachedSalesRatio = _computeProtectedSalesRatio();
             lastSalesRatioUpdate = block.timestamp;
         }
         return cachedSalesRatio;
@@ -215,9 +218,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (salesRatioUpdatePaused) {
             return cachedSalesRatio;
         }
-        uint256 sold = totalNFTSupply - IERC721(promptNFT).balanceOf(salesAddress);
-        uint256 rawRatio = sold * 1e18 / totalNFTSupply;
-        return rawRatio > maxSalesRatio ? maxSalesRatio : rawRatio;
+        return _computeProtectedSalesRatio();
     }
 
     /// @notice 获取用户所有质押NFT列表（分页）
@@ -595,7 +596,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
         uint256 acc = accRewardPerWeight;
         if (nowTime > lastRewardTimestamp && totalStakeCount > 0) {
-            // 使用受保护的销售比例计算（视图版）
             uint256 ratio = getProtectedSalesRatioView();
             uint256 reward = _emittedUntil(nowTime) - _emittedUntil(lastRewardTimestamp);
             uint256 adjustedReward = reward * ratio / 1e18;
