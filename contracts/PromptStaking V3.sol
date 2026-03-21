@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
-// NFT质押合约 V4.0
+// NFT质押合约
 //
 // 支持1种NFT（Prompt），按权重分配PTC奖励。
 // 质押挖矿的总数量：30亿
-// 释放规则：第一年25%，第二年15%，第三年12%，第四年10%，第五年8%，从第六年开始把剩余数量按照每年释放50%逐年减半的逻辑释放。
-// 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。
-// 奖励分配：用户收益 = 总释放奖励 × 销售比例，剩余部分进入缓冲池。
-// 提现：管理员控制，用户不能自行提现，支持随时为用户提现全部奖励。
+// 总周期数量：共 6 个周期T1-T6，每个周期是1年，周期内线性释放，一共 6 年发完。
+// 周期T1 释放12亿
+// 周期T2 释放9亿 
+// 周期T3 释放4.5亿
+// 周期T4 释放2.25亿
+// 周期T5 释放1.125亿
+// 周期T6 释放1.125亿
+// 提现限制：从整体生息开始时间之后的t时间内，用户最多只能提取x比例。t时间外，用户可以提取全部。
+// 锁定参数和手续费参数修改需要经过时间锁（24h）。
 // 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
@@ -57,9 +62,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     IERC20 public immutable ptc;           // PTC代币合约
     address public immutable promptNFT;    // Prompt NFT合约地址
 
-    uint256 public constant TOTAL_REWARD = 3000000000 ether; // 总奖励 30亿
-
-    // Reward schedule: 前5年固定，第6年开始动态释放
+    // Reward schedule: 6 periods (T1..T6), each 1 year, linear release within each period.
     uint256 public constant SCHEDULE_PERIODS = 6;
     uint256 public constant SCHEDULE_PERIOD_DURATION = 365 days; // 1 year per period
     // Total PTC to release per period (units: wei)
@@ -71,51 +74,27 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public accRewardPerWeight;   // 全局积分累加器（1e18精度）
     uint256 public lastRewardTimestamp;  // 上次奖励计算时间戳
     uint256 public totalStakeCount;      // 全局质押的NFT总数
-    uint256 public totalPendingReward;   // 全局待领取奖励总量
 
-    // -------------------- 销售参数 --------------------
-    uint256 public totalNFTSupply;       // NFT发行总数
-    address public salesAddress;         // 销售地址
-
-    // -------------------- 缓冲池参数 --------------------
-    address public bufferPool;
-    uint256 public bufferPoolReward;
-    uint256 public pendingBufferWithdrawal;
-    uint256 public bufferWithdrawalRequestTime;
+    // -------------------- 提现限制 --------------------
+    // 限制定义：从全局奖励开始时间 `startRewardTimestamp` 开始的前 `withdrawalLimitDuration` 秒内，
+    // 用户每次最多可提取其 `pendingReward` 的 `withdrawalLimitRate/10000`；在该限制期之后，用户可以提取全部。
+    uint256 public withdrawalLimitDuration; // 提现限制时间，单位秒（相对于 `startRewardTimestamp`）
+    uint256 public withdrawalLimitRate;     // 允许在限制时间内提取的最大比例，单位1e4（10000=100%）
+    
+    uint256 public pendingWithdrawalLimitDuration; // 待变更的提现限制时间
+    uint256 public pendingWithdrawalLimitRate;     // 待变更的提现限制比例
+    uint256 public withdrawalLimitChangeTime;      // 提现限制变更时间锁
+    uint256 public constant WITHDRAWAL_CHANGE_DELAY = 1 days;// 提现限制变更时间锁延迟（1天）
 
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
+    uint256 public feeRate;      // 手续费率，单位1e4（100=1%）
+    uint256 public pendingFee;   // 累计未提取手续费
 
-    // -------------------- 缓冲池提现延迟参数 --------------------
-    uint256 public constant BUFFER_WITHDRAWAL_DELAY = 1 days; // 缓冲池提取延迟时间
-
-    // -------------------- 销售比例保护参数 --------------------
-    uint256 public maxSalesRatio; // 最大销售比例上限（1e18精度）
-    uint256 private lastSalesRatioUpdate; // 上次销售比例更新时间
-    uint256 private cachedSalesRatio; // 缓存的销售比例（1e18精度）
-
-    // -------------------- 紧急控制参数 --------------------
-    bool public salesRatioUpdatePaused; // 销售比例更新暂停标志
-
-    /// @notice 紧急暂停销售比例更新（防止外部合约攻击）
-    function emergencyPauseSalesRatioUpdate() external onlyOwner {
-        salesRatioUpdatePaused = true;
-        emit SalesRatioUpdatePaused(msg.sender);
-    }
-
-    /// @notice 恢复销售比例更新
-    function resumeSalesRatioUpdate() external onlyOwner {
-        salesRatioUpdatePaused = false;
-        emit SalesRatioUpdateResumed(msg.sender);
-    }
-
-    /// @notice 设置最大销售比例上限（1e18精度，<=100%）
-    /// @param _maxSalesRatio 新的最大销售比例
-    function setMaxSalesRatio(uint256 _maxSalesRatio) external onlyOwner {
-        require(_maxSalesRatio > 0 && _maxSalesRatio <= 1e18, "invalid maxSalesRatio");
-        maxSalesRatio = _maxSalesRatio;
-        emit MaxSalesRatioSet(msg.sender, _maxSalesRatio);
-    }
+    address public pendingFeeRecipient; // 待变更的手续费接收地址
+    uint256 public pendingFeeRate;      // 待变更的手续费率
+    uint256 public feeRateChangeTime;   // 手续费变更时间锁
+    uint256 public constant FEE_CHANGE_DELAY = 1 days;// 手续费变更时间锁延迟（1天）
 
     // -------------------- 事件定义 --------------------
     event Staked(address indexed user, uint256 indexed tokenId);
@@ -125,14 +104,11 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event ERC20Rescued(address indexed operator, address token, uint256 amount);
     event ERC721Rescued(address indexed operator, address nft, uint256 tokenId);
     event GASRescued(address indexed operator, uint256 amount);
-    event PoolAdded(address indexed admin, uint256 amount);
-    event BufferPoolWithdrawn(address indexed admin, uint256 amount);
-    event BufferPoolSet(address indexed admin, address newBufferPool);
-    event BufferPoolWithdrawalRequested(address indexed admin, uint256 amount, uint256 requestTime);
-    event BufferPoolWithdrawalCancelled(address indexed admin);
-    event SalesRatioUpdatePaused(address indexed admin);
-    event SalesRatioUpdateResumed(address indexed admin);
-    event MaxSalesRatioSet(address indexed admin, uint256 maxSalesRatio);
+    event FeeRateProposed(address indexed proposer, address newRecipient, uint256 newRate, uint256 executeTime);
+    event FeeRateChanged(address indexed executor, address newRecipient, uint256 newRate);
+    event FeeClaimed(address indexed recipient, uint256 amount);
+    event WithdrawalLimitProposed(address indexed proposer, uint256 newDuration, uint256 newRate, uint256 executeTime);
+    event WithdrawalLimitChanged(address indexed executor, uint256 newDuration, uint256 newRate);
     
     // -------------------- 构造函数 --------------------
     /// @notice 构造函数，初始化PTC和NFT合约地址及奖励起始时间
@@ -140,28 +116,29 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @param _promptNFT Prompt NFT地址
     /// @param _startTime 奖励产出起始时间（0为立即开始）
     /// @param _feeRecipient 手续费接收地址
-    /// @param _totalNFTSupply NFT发行总数
-    /// @param _salesAddress 销售地址
+    /// @param _withdrawalLimitDuration 提现限制窗口，单位秒（相对于 `startRewardTimestamp`）
+    /// @param _withdrawalLimitRate 提现限制内允许提取比例，单位1e4（10000=100%）
     constructor(
         address _ptc,
         address _promptNFT,
         uint256 _startTime,
         address _feeRecipient,
-        uint256 _totalNFTSupply,
-        address _salesAddress
+        uint256 _withdrawalLimitDuration,
+        uint256 _withdrawalLimitRate // in 1e4, 10000 == 100%
     ) Ownable(msg.sender)
     {
         require(_ptc != address(0), "address zero");
         require(_promptNFT != address(0), "address zero");
         require(_feeRecipient != address(0), "address zero");
-        require(_salesAddress != address(0), "address zero");
-        require(_totalNFTSupply > 0, "Invalid total NFT supply");
+        require(_withdrawalLimitRate <= 10000, "Invalid withdrawal rate");
 
         ptc = IERC20(_ptc);
         promptNFT = _promptNFT;
         feeRecipient = _feeRecipient;
-        totalNFTSupply = _totalNFTSupply;
-        salesAddress = _salesAddress;
+
+        // 初始化提现限制
+        withdrawalLimitDuration = _withdrawalLimitDuration;
+        withdrawalLimitRate = _withdrawalLimitRate;
 
         if (_startTime == 0) {
             startRewardTimestamp = block.timestamp;
@@ -169,57 +146,20 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             require(_startTime >= block.timestamp, "StartTime must be in the future");
             startRewardTimestamp = _startTime;
         }
-        // 初始化销售比例缓存
-        cachedSalesRatio = 0;
-        lastSalesRatioUpdate = 0;
-        // 默认允许最高100%销售比例
-        maxSalesRatio = 1e18;
+        // Set end timestamp to cover all schedule periods (6 * 1 year = 6 years)
+        endRewardTimestamp = startRewardTimestamp + SCHEDULE_PERIODS * SCHEDULE_PERIOD_DURATION;
 
         // Initialize schedule totals (单位: 亿 = 100,000,000)
-        // 第一年: 25% = 7.5亿
-        schedulePeriodTotals[0] = TOTAL_REWARD * 25 / 100;
-        // 第二年: 15% = 4.5亿
-        schedulePeriodTotals[1] = TOTAL_REWARD * 15 / 100;
-        // 第三年: 12% = 3.6亿
-        schedulePeriodTotals[2] = TOTAL_REWARD * 12 / 100;
-        // 第四年: 10% = 3亿
-        schedulePeriodTotals[3] = TOTAL_REWARD * 10 / 100;
-        // 第五年: 8% = 2.4亿
-        schedulePeriodTotals[4] = TOTAL_REWARD * 8 / 100;
-        // 第六年及以后: 动态释放
-        schedulePeriodTotals[5] = 0;
+        // T1: 12亿, T2: 9亿, T3: 4.5亿, T4: 2.25亿, T5: 1.125亿, T6: 1.125亿
+        schedulePeriodTotals[0] = 1200000000 ether; // 12亿
+        schedulePeriodTotals[1] = 900000000 ether;  // 9亿
+        schedulePeriodTotals[2] = 450000000 ether;  // 4.5亿
+        schedulePeriodTotals[3] = 225000000 ether;  // 2.25亿
+        schedulePeriodTotals[4] = 112500000 ether;  // 1.125亿
+        schedulePeriodTotals[5] = 112500000 ether;  // 1.125亿
     }
 
     // -------------------- 辅助查询函数 ------------------
-    /// @notice 获取受保护的销售比例（带缓存、上限保护和紧急暂停）
-    /// @return 销售比例（1e18精度）
-    function getProtectedSalesRatio() public returns (uint256) {
-        // 如果紧急暂停，使用缓存值
-        if (salesRatioUpdatePaused) {
-            return cachedSalesRatio;
-        }
-        // 每小时最多更新一次销售比例
-        if (block.timestamp - lastSalesRatioUpdate >= 1 hours) {
-            uint256 sold = totalNFTSupply - IERC721(promptNFT).balanceOf(salesAddress);
-            uint256 rawRatio = sold * 1e18 / totalNFTSupply;
-            // 应用最大上限保护
-            cachedSalesRatio = rawRatio > maxSalesRatio ? maxSalesRatio : rawRatio;
-            lastSalesRatioUpdate = block.timestamp;
-        }
-        return cachedSalesRatio;
-    }
-
-    /// @notice 获取受保护的销售比例（视图版，不修改状态）
-    /// @return 销售比例（1e18精度）
-    function getProtectedSalesRatioView() public view returns (uint256) {
-        if (salesRatioUpdatePaused) {
-            return cachedSalesRatio;
-        }
-        uint256 sold = totalNFTSupply - IERC721(promptNFT).balanceOf(salesAddress);
-        uint256 rawRatio = sold * 1e18 / totalNFTSupply;
-        return rawRatio > maxSalesRatio ? maxSalesRatio : rawRatio;
-    }
-
     /// @notice 获取用户所有质押NFT列表（分页）
     /// @param user 用户地址
     /// @param offset 偏移量
@@ -261,20 +201,29 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         claimed = users[user].claimed;
     }
 
+    /// @notice 获取提现限制配置信息及当前是否处于限制期
+    /// @return duration 限制期时长
+    /// @return rate 限制内允许提取比例，单位 1e4（10000 == 100%）
+    /// @return restricted 当前是否仍在限制期
+    function getWithdrawalLimitInfo() external view returns (uint256 duration, uint256 rate, bool restricted) {
+        duration = withdrawalLimitDuration;
+        rate = withdrawalLimitRate;
+        // 仅在 startRewardTimestamp 至 startRewardTimestamp + duration 之间视为限制期
+        restricted = (duration != 0 && block.timestamp >= startRewardTimestamp && block.timestamp < startRewardTimestamp + duration);
+    }
+
     /// @notice 获取合约关键全局统计信息，便于链下监控
     /// @return _totalStakeCount 全局质押NFT总数
     /// @return _accRewardPerWeight 全局 accRewardPerWeight
     /// @return _lastRewardTimestamp 上次奖励计算时间戳
     /// @return _startRewardTimestamp 奖励开始时间戳
     /// @return _endRewardTimestamp 奖励结束时间戳
-    /// @return _bufferPoolReward 缓冲池总量
-    function getSystemStats() external view returns (uint256 _totalStakeCount, uint256 _accRewardPerWeight, uint256 _lastRewardTimestamp, uint256 _startRewardTimestamp, uint256 _endRewardTimestamp, uint256 _bufferPoolReward) {
+    function getSystemStats() external view returns (uint256 _totalStakeCount, uint256 _accRewardPerWeight, uint256 _lastRewardTimestamp, uint256 _startRewardTimestamp, uint256 _endRewardTimestamp) {
         _totalStakeCount = totalStakeCount;
         _accRewardPerWeight = accRewardPerWeight;
         _lastRewardTimestamp = lastRewardTimestamp;
         _startRewardTimestamp = startRewardTimestamp;
         _endRewardTimestamp = endRewardTimestamp;
-        _bufferPoolReward = bufferPoolReward;
     }
 
     // -------------------- 核心函数 --------------------
@@ -293,52 +242,26 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
         // Compute total emitted up to 'to' and up to 'from', then take difference.
         uint256 reward = _emittedUntil(to) - _emittedUntil(from);
-        // 使用受保护的销售比例计算
-        uint256 ratio = getProtectedSalesRatio();
-        // 调整奖励
-        uint256 adjustedReward = reward * ratio / 1e18;
-        // 剩余部分进入缓冲池
-        bufferPoolReward += reward - adjustedReward;
-        // 分配给用户（手续费在提现时扣除）
-        accRewardPerWeight += adjustedReward * 1e18 / totalStakeCount;
+        // 计算本次应收手续费
+        uint256 fee = reward * feeRate / 1e4;
+        pendingFee += fee;
+        // 分配给用户
+        accRewardPerWeight += (reward - fee) * 1e18 / totalStakeCount;
         lastRewardTimestamp = nowTime;
     }
 
-    /// @dev 计算从奖励开始到时间`t`的总释放量，包含前5年固定释放和第6年开始的动态释放
-    /// 修复：使用确定性计算，不依赖合约当前余额，避免循环依赖问题
+    /// @notice Returns total amount emitted from schedule start up to time `t` 
     function _emittedUntil(uint256 t) public view returns (uint256) {
         if (t <= startRewardTimestamp) return 0;
         if (t > endRewardTimestamp) t = endRewardTimestamp;
         uint256 total = 0;
         uint256 periodDuration = SCHEDULE_PERIOD_DURATION;
-        // 前5年固定释放
-        for (uint256 i = 0; i < 5; i++) {
+        for (uint256 i = 0; i < SCHEDULE_PERIODS; i++) {
             uint256 periodStart = startRewardTimestamp + i * periodDuration;
             if (t <= periodStart) break;
             uint256 periodEnd = periodStart + periodDuration;
             uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
             total += schedulePeriodTotals[i] * elapsed / periodDuration;
-        }
-        // 从第六年开始动态释放
-        uint256 start6 = startRewardTimestamp + 5 * periodDuration;
-        if (t > start6) {
-            uint256 remaining = ptc.balanceOf(address(this)) - totalPendingReward - bufferPoolReward;
-            uint256 fraction = 5000; // 50% = 5000/10000
-            uint256 yearsPassed = (t - start6) / periodDuration;
-            for (uint256 y = 0; y <= yearsPassed && remaining > 0; y++) {
-                uint256 releaseThisYear = remaining * fraction / 10000;
-                uint256 periodStart = start6 + y * periodDuration;
-                if (t <= periodStart) break;
-                uint256 periodEnd = periodStart + periodDuration;
-                uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
-                total += releaseThisYear * elapsed / periodDuration;
-                remaining -= releaseThisYear;
-                if (fraction > 1) {
-                    fraction /= 2;
-                } else {
-                    fraction = 0;
-                }
-            }
         }
         return total;
     }
@@ -352,7 +275,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (stakeCount > 0) {
             uint256 pending = stakeCount * (accRewardPerWeight - u.rewardDebt) / 1e18;
             u.pendingReward += pending;
-            totalPendingReward += pending;
         }
         u.rewardDebt = accRewardPerWeight;
     }
@@ -374,6 +296,38 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         delete stakeIndex[user][tokenId];
         delete nftOwners[tokenId];
         totalStakeCount -= 1;
+    }
+
+    /// @notice 内部函数：计算在当前提现限制下，用户最多可领取的数量
+    /// 注意，调用本函数前，须确保刚执行过_updateReward(msg.sender)以同步用户的 u.pendingReward
+    function _allowedClaimAmount(UserInfo storage u) internal view returns (uint256) {
+        uint256 totalPending = u.pendingReward;
+        if (withdrawalLimitDuration == 0) return totalPending;
+        // 如果不在限制窗口内：可以提取全部
+        if (block.timestamp >= startRewardTimestamp + withdrawalLimitDuration) {
+            return totalPending;
+        }
+        // 基数包含用户已累计领走的数量与当前可领取的数量（即“已提取 + 待提取”）
+        uint256 baseTotal = u.claimed + totalPending; // 包含历史已领取 + 当前可领
+        uint256 allowedTotal = baseTotal * withdrawalLimitRate / 1e4;
+        if (allowedTotal <= u.claimed) return 0;
+        uint256 remaining = allowedTotal - u.claimed;
+        return totalPending <= remaining ? totalPending : remaining;
+    }
+
+    /// @notice 查询在提现限制下用户当前允许领取的数量
+    /// @dev 基数为 `已累计领取 (u.claimed)` + `当前可领取 (claimable(user))`。
+    function allowedClaimable(address user) external view returns (uint256) {
+        uint256 total = claimable(user);
+        UserInfo storage u = users[user];
+        if (withdrawalLimitDuration == 0) return total;
+        // 如果不在限制窗口期：可以提取全部
+        if (block.timestamp >= startRewardTimestamp + withdrawalLimitDuration) return total;
+        uint256 baseTotal = u.claimed + total;
+        uint256 allowedTotal = baseTotal * withdrawalLimitRate / 1e4;
+        if (allowedTotal <= u.claimed) return 0;
+        uint256 remain = allowedTotal - u.claimed;
+        return remain <= total ? remain : total;
     }
 
     // ========== 质押解押相关 ==========
@@ -454,138 +408,47 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         totalStakeCount -= count;
     }
 
-    /// @notice 管理员为用户提现所有可领取的PTC奖励（扣除手续费）
-    /// @param user 用户地址
-    /// @param feeRate 手续费率，单位1e4（100=1%）
-    function withdrawForUser(address user, uint256 feeRate) external nonReentrant whenNotPaused onlyOwner {
-        require(feeRate <= 10000, "Invalid fee rate");
-        _updateReward(user);
-        UserInfo storage u = users[user];
+    /// @notice 领取所有可领取的PTC奖励
+    function claim() external nonReentrant whenNotPaused {
+        _updateReward(msg.sender);
+        UserInfo storage u = users[msg.sender];
+        // 使用 claimable() 作为权威的可领取值（包含未写入 pending 的部分）
         uint256 totalPending = u.pendingReward;
         require(totalPending > 0, "No claimable reward");
 
-        uint256 amountToClaim = totalPending;
+        uint256 allowed = _allowedClaimAmount(u);
+        require(allowed > 0, "Claim amount limited to zero");
+
+        uint256 amountToClaim = totalPending <= allowed ? totalPending : allowed;
         require(ptc.balanceOf(address(this)) >= amountToClaim, "Insufficient balance");
 
-        // 计算手续费
-        uint256 fee = amountToClaim * feeRate / 1e4;
-        uint256 netAmount = amountToClaim - fee;
-
-        // 扣减用户 pending
+        // 扣减用户 pending（_updateReward 已保证 u.pendingReward 与 claimable 一致）
         u.pendingReward -= amountToClaim;
-        totalPendingReward -= amountToClaim;
         u.claimed += amountToClaim;
 
-        emit Claimed(user, netAmount);
-        ptc.safeTransfer(user, netAmount);
-        // 手续费转给 feeRecipient
-        if (fee > 0) {
-            ptc.safeTransfer(feeRecipient, fee);
-        }
+        emit Claimed(msg.sender, amountToClaim);
+        ptc.safeTransfer(msg.sender, amountToClaim);
     }
 
-    /// @notice 管理员为用户提现指定数量的PTC奖励（扣除手续费）
-    /// @param user 用户地址
-    /// @param amount 提现金额
-    /// @param feeRate 手续费率，单位1e4（100=1%）
-    function withdrawForUser(address user, uint256 amount, uint256 feeRate) external nonReentrant whenNotPaused onlyOwner {
-        require(feeRate <= 10000, "Invalid fee rate");
-        _updateReward(user);
-        UserInfo storage u = users[user];
+    /// @notice 领取指定数量的PTC奖励
+    function claim(uint256 amount) external nonReentrant whenNotPaused {
+        _updateReward(msg.sender); // 更新用户奖励
+        UserInfo storage u = users[msg.sender];
 
         require(amount > 0, "Amount must be greater than zero");
-        uint256 totalPending = claimable(user);
+        // 使用 claimable() 作为权威的可领取值
+        uint256 totalPending = claimable(msg.sender);
         require(amount <= totalPending, "Amount exceeds claimable reward");
+
+        uint256 allowed = _allowedClaimAmount(u);
+        require(amount <= allowed, "Amount exceeds allowed claim limit");
         require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
 
-        // 计算手续费
-        uint256 fee = amount * feeRate / 1e4;
-        uint256 netAmount = amount - fee;
-
         u.pendingReward -= amount;
-        totalPendingReward -= amount;
         u.claimed += amount;
 
-        ptc.safeTransfer(user, netAmount);
-        emit Claimed(user, netAmount);
-        // 手续费转给 feeRecipient
-        if (fee > 0) {
-            ptc.safeTransfer(feeRecipient, fee);
-        }
-    }
-
-    /// @notice 管理员批量为用户提现所有可领取的PTC奖励（扣除手续费）
-    /// @param _users 用户地址数组
-    /// @param feeRates 手续费率数组，单位1e4（100=1%），对应每个用户
-    function withdrawForUsers(address[] calldata _users, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyOwner {
-        require(_users.length == feeRates.length, "Users and feeRates length mismatch");
-        for (uint256 i = 0; i < _users.length; i++) {
-            require(feeRates[i] <= 10000, "Invalid fee rate");
-        }
-        for (uint256 i = 0; i < _users.length; i++) {
-            address user = _users[i];
-            uint256 feeRate = feeRates[i];
-            _updateReward(user);
-            UserInfo storage u = users[user];
-            uint256 totalPending = u.pendingReward;
-            if (totalPending == 0) continue;
-
-            uint256 amountToClaim = totalPending;
-            if (ptc.balanceOf(address(this)) < amountToClaim) continue; // 跳过不足的
-
-            // 计算手续费
-            uint256 fee = amountToClaim * feeRate / 1e4;
-            uint256 netAmount = amountToClaim - fee;
-
-            u.pendingReward -= amountToClaim;
-            totalPendingReward -= amountToClaim;
-            u.claimed += amountToClaim;
-
-            emit Claimed(user, netAmount);
-            ptc.safeTransfer(user, netAmount);
-            // 手续费转给 feeRecipient
-            if (fee > 0) {
-                ptc.safeTransfer(feeRecipient, fee);
-            }
-        }
-    }
-
-    /// @notice 管理员批量为用户提现指定数量的PTC奖励（扣除手续费）
-    /// @param _users 用户地址数组
-    /// @param amounts 提现金额数组，对应每个用户
-    /// @param feeRates 手续费率数组，单位1e4（100=1%），对应每个用户
-    function withdrawForUsers(address[] calldata _users, uint256[] calldata amounts, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyOwner {
-        require(_users.length == amounts.length && amounts.length == feeRates.length, "Length mismatch");
-        for (uint256 i = 0; i < feeRates.length; i++) {
-            require(feeRates[i] <= 10000, "Invalid fee rate");
-        }
-        for (uint256 i = 0; i < _users.length; i++) {
-            address user = _users[i];
-            uint256 amount = amounts[i];
-            uint256 feeRate = feeRates[i];
-            if (amount == 0) continue;
-
-            _updateReward(user);
-            UserInfo storage u = users[user];
-            uint256 totalPending = claimable(user);
-            if (amount > totalPending) continue;
-            if (ptc.balanceOf(address(this)) < amount) continue;
-
-            // 计算手续费
-            uint256 fee = amount * feeRate / 1e4;
-            uint256 netAmount = amount - fee;
-
-            u.pendingReward -= amount;
-            totalPendingReward -= amount;
-            u.claimed += amount;
-
-            ptc.safeTransfer(user, netAmount);
-            emit Claimed(user, netAmount);
-            // 手续费转给 feeRecipient
-            if (fee > 0) {
-                ptc.safeTransfer(feeRecipient, fee);
-            }
-        }
+        ptc.safeTransfer(msg.sender, amount); // 转移PTC到用户地址
+        emit Claimed(msg.sender, amount); // 触发领取奖励事件
     }
         
     /// @notice 查询用户当前可领取的PTC奖励（包含未更新周期）
@@ -595,11 +458,9 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
         uint256 acc = accRewardPerWeight;
         if (nowTime > lastRewardTimestamp && totalStakeCount > 0) {
-            // 使用受保护的销售比例计算（视图版）
-            uint256 ratio = getProtectedSalesRatioView();
             uint256 reward = _emittedUntil(nowTime) - _emittedUntil(lastRewardTimestamp);
-            uint256 adjustedReward = reward * ratio / 1e18;
-            acc += adjustedReward * 1e18 / totalStakeCount;
+            uint256 fee = reward * feeRate / 1e4;
+            acc += (reward - fee) * 1e18 / totalStakeCount;
         }
         return u.pendingReward + (stakeCount * (acc - u.rewardDebt) / 1e18);
     }
@@ -634,7 +495,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 用户紧急批量解押（仅暂停时可用，不结算奖励）
-    /// 修复：不重置rewardDebt，避免用户奖励丢失
+    // 注意：紧急解押不会计算奖励，直接将NFT转回用户
     function emergencyUnstakeBatch(uint256 count) external nonReentrant whenPaused {
         StakeInfo[] storage stakes = users[msg.sender].stakes;
         require(stakes.length > 0, "No NFT staked");
@@ -649,8 +510,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             IERC721(promptNFT).safeTransferFrom(address(this), msg.sender, tid);
         }
         totalStakeCount -= n;
-        // 移除：不再重置rewardDebt，避免奖励丢失
-        // users[msg.sender].rewardDebt = accRewardPerWeight;
+        users[msg.sender].rewardDebt = accRewardPerWeight;
     }
 
     /// @notice 平台管理员（owner）随时解押任意NFT返回至原质押用户（含结算）
@@ -669,19 +529,70 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         }
     }
 
-    /// @notice 设置手续费接收地址
-    /// @param _feeRecipient 新的手续费接收地址
-    function setFeeRecipient(address _feeRecipient) external onlyOwner {
-        require(_feeRecipient != address(0), "Zero address");
-        feeRecipient = _feeRecipient;
+    /// @notice 提议变更手续费接收地址和费率
+    /// @dev 变更需要经过时间锁，防止恶意操作
+    /// @param _rate 手续费率，单位1e4，最大10000（100%）
+    /// @param _recipient 新的手续费接收地址
+    function proposeFeeChange(address _recipient, uint256 _rate) external onlyOwner {
+        require(_rate <= 10000, "Fee too high");
+        require(_recipient != address(0), "Zero address");
+        require(_recipient != feeRecipient || _rate != feeRate, "No change");
+        require(_recipient != pendingFeeRecipient || _rate != pendingFeeRate,"No change");
+        // 只有最后一次 propose 的参数会生效
+        pendingFeeRecipient = _recipient;
+        pendingFeeRate = _rate;
+        feeRateChangeTime = block.timestamp + FEE_CHANGE_DELAY;
+        emit FeeRateProposed(msg.sender, _recipient, _rate, feeRateChangeTime);
     }
 
-    /// @notice 管理员添加PTC到池子
-    /// @param amount 添加的PTC数量
-    function addToPool(uint256 amount) external onlyOwner nonReentrant {
-        require(amount > 0, "Amount must be greater than zero");
-        ptc.safeTransferFrom(msg.sender, address(this), amount);
-        emit PoolAdded(msg.sender, amount);
+    /// @notice 手续费变更时间锁，单位秒
+    function applyFeeChange() external onlyOwner {
+        require(feeRateChangeTime > 0 && block.timestamp >= feeRateChangeTime, "Not ready");
+        require(pendingFeeRecipient != feeRecipient || pendingFeeRate != feeRate,"No change");
+        feeRecipient = pendingFeeRecipient;
+        feeRate = pendingFeeRate;
+        emit FeeRateChanged(msg.sender, feeRecipient, feeRate);
+        // 清空pending
+        feeRateChangeTime = 0;
+        pendingFeeRecipient = address(0);
+        pendingFeeRate = 0;
+    }
+
+    /// @notice 手续费接收地址提取累计手续费
+    function claimFee() external nonReentrant {
+        require(msg.sender == feeRecipient, "Not recipient");
+        uint256 amount = pendingFee;
+        require(amount > 0, "No fee");
+        require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
+        pendingFee = 0;
+        emit FeeClaimed(msg.sender, amount); 
+        ptc.safeTransfer(feeRecipient, amount);
+    }
+
+    /// @notice 提议变更提现限制参数
+    /// @param _duration 提现限制时间，单位秒（相对于 `startRewardTimestamp`）
+    /// @param _rate 提现限制内允许提取比例，单位1e4（10000=100%）  
+    function proposeWithdrawalLimitChange(uint256 _duration, uint256 _rate) external onlyOwner {
+        require(_rate <= 10000, "Invalid withdrawal rate");
+        require(_duration != withdrawalLimitDuration || _rate != withdrawalLimitRate, "No change");
+        require(_duration != pendingWithdrawalLimitDuration || _rate != pendingWithdrawalLimitRate, "No change");
+        pendingWithdrawalLimitDuration = _duration;
+        pendingWithdrawalLimitRate = _rate;
+        withdrawalLimitChangeTime = block.timestamp + WITHDRAWAL_CHANGE_DELAY;
+        emit WithdrawalLimitProposed(msg.sender, _duration, _rate, withdrawalLimitChangeTime);
+    }
+
+    /// @notice 提现限制变更时间锁，单位秒
+    function applyWithdrawalLimitChange() external onlyOwner {
+        require(withdrawalLimitChangeTime > 0 && block.timestamp >= withdrawalLimitChangeTime, "Not ready");
+        require(pendingWithdrawalLimitDuration != withdrawalLimitDuration || pendingWithdrawalLimitRate != withdrawalLimitRate, "No change");
+        withdrawalLimitDuration = pendingWithdrawalLimitDuration;
+        withdrawalLimitRate = pendingWithdrawalLimitRate;
+        emit WithdrawalLimitChanged(msg.sender, withdrawalLimitDuration, withdrawalLimitRate);
+        // 清空pending
+        withdrawalLimitChangeTime = 0;
+        pendingWithdrawalLimitDuration = 0;
+        pendingWithdrawalLimitRate = 0;
     }
 
     /// @notice 合约暂停（仅owner可调）
@@ -692,45 +603,5 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @notice 合约恢复（仅owner可调）
     function unpause() external onlyOwner {
         _unpause();
-    }
-
-    /// @notice 设置缓冲池地址
-    /// @param _bufferPool 新的缓冲池地址
-    function setBufferPool(address _bufferPool) external onlyOwner {
-        require(_bufferPool != address(0), "Zero address");
-        bufferPool = _bufferPool;
-        emit BufferPoolSet(msg.sender, _bufferPool);
-    }
-
-    /// @notice 管理员请求提现缓冲池奖励（时间锁保护）
-    /// @param amount 请求提现的金额
-    function requestBufferWithdrawal(uint256 amount) external onlyOwner {
-        require(amount > 0, "Amount must be greater than zero");
-        require(amount <= bufferPoolReward, "Insufficient buffer pool reward");
-        require(bufferPool != address(0), "Buffer pool not set");
-
-        pendingBufferWithdrawal = amount;
-        bufferWithdrawalRequestTime = block.timestamp;
-        emit BufferPoolWithdrawalRequested(msg.sender, amount, bufferWithdrawalRequestTime);
-    }
-
-    /// @notice 管理员执行缓冲池提现（需等待延迟时间）
-    function executeBufferWithdrawal() external onlyOwner nonReentrant {
-        require(pendingBufferWithdrawal > 0, "No pending withdrawal");
-        require(block.timestamp >= bufferWithdrawalRequestTime + BUFFER_WITHDRAWAL_DELAY,
-                "Withdrawal delay not met");
-        require(bufferPool != address(0), "Buffer pool not set");
-
-        uint256 amount = pendingBufferWithdrawal;
-        require(amount <= bufferPoolReward, "Insufficient buffer pool reward");
-
-        // 清空待处理请求
-        pendingBufferWithdrawal = 0;
-        bufferWithdrawalRequestTime = 0;
-
-        // 执行提现
-        bufferPoolReward -= amount;
-        ptc.safeTransfer(bufferPool, amount);
-        emit BufferPoolWithdrawn(msg.sender, amount);
     }
 }
