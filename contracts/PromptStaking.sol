@@ -79,6 +79,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public lastRewardTimestamp;  // 上次奖励计算时间戳
     uint256 public totalStakeCount;      // 全局质押的NFT总数
     uint256 public totalPendingReward;   // 全局待领取奖励总量
+    uint256 public totalClaimedPTC;      // 全局已发放给用户的PTC总量（不含缓冲池）
 
     // -------------------- 销售参数 --------------------
     uint256 public totalNFTSupply;       // NFT发行总数
@@ -271,6 +272,23 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         _lastRewardTimestamp = lastRewardTimestamp;
         _startRewardTimestamp = startRewardTimestamp;
         _bufferPoolReward = bufferPoolReward;
+    }
+
+    /// @notice 获取当前全局已发放给用户的PTC总量，包括已领取和未领取部分（不含缓冲池）
+    /// 计算方式：totalClaimedPTC + totalPendingReward + 当前周期未结算的奖励（按销售比例调整）
+    /// 是模糊值，因为当前周期奖励按比例调整后会进入缓冲池，无法准确分配到用户，但可以近似认为未结算部分也属于用户待领取范围
+    /// 因手续费在提现时扣除，合约里不知道手续费具体多少，所以不考虑手续费因素，直接计算按销售比例调整后的奖励总量
+    function getTotalAllocatedPTC() external view returns (uint256) {
+        uint256 unaccounted = 0;
+        uint256 nowTime = block.timestamp;
+        uint256 lastTime = lastRewardTimestamp == 0 ? startRewardTimestamp : lastRewardTimestamp;
+        if (nowTime > lastTime && totalStakeCount > 0) {
+            uint256 ratio = getProtectedSalesRatioView();
+            uint256 reward = _emittedUntil(nowTime) - _emittedUntil(lastTime);
+            uint256 adjustedReward = reward * ratio / 1e18;
+            unaccounted = adjustedReward;
+        }
+        return totalClaimedPTC + totalPendingReward + unaccounted;
     }
 
     // -------------------- 核心函数 --------------------
@@ -468,6 +486,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
         emit Claimed(user, netAmount);
         ptc.safeTransfer(user, netAmount);
+        totalClaimedPTC += netAmount;
         // 手续费转给 feeRecipient
         if (fee > 0) {
             ptc.safeTransfer(feeRecipient, fee);
@@ -497,6 +516,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         u.claimed += amount;
 
         ptc.safeTransfer(user, netAmount);
+        totalClaimedPTC += netAmount;
         emit Claimed(user, netAmount);
         // 手续费转给 feeRecipient
         if (fee > 0) {
@@ -521,7 +541,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             if (totalPending == 0) continue;
 
             uint256 amountToClaim = totalPending;
-            if (ptc.balanceOf(address(this)) < amountToClaim) continue; // 跳过不足的
+            require(ptc.balanceOf(address(this)) >= amountToClaim, "Insufficient balance");
 
             // 计算手续费
             uint256 fee = amountToClaim * feeRate / 1e4;
@@ -533,6 +553,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
 
             emit Claimed(user, netAmount);
             ptc.safeTransfer(user, netAmount);
+            totalClaimedPTC += netAmount;
             // 手续费转给 feeRecipient
             if (fee > 0) {
                 ptc.safeTransfer(feeRecipient, fee);
@@ -553,13 +574,13 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             address user = _users[i];
             uint256 amount = amounts[i];
             uint256 feeRate = feeRates[i];
-            if (amount == 0) continue;
+            require(amount > 0, "Amount must be greater than zero");
 
             _updateReward(user);
             UserInfo storage u = users[user];
             uint256 totalPending = claimable(user);
-            if (amount > totalPending) continue;
-            if (ptc.balanceOf(address(this)) < amount) continue;
+            require(amount <= totalPending, "Amount exceeds claimable reward");
+            require(ptc.balanceOf(address(this)) >= amount, "Insufficient balance");
 
             // 计算手续费
             uint256 fee = amount * feeRate / 1e4;
@@ -570,6 +591,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             u.claimed += amount;
 
             ptc.safeTransfer(user, netAmount);
+            totalClaimedPTC += netAmount;
             emit Claimed(user, netAmount);
             // 手续费转给 feeRecipient
             if (fee > 0) {
