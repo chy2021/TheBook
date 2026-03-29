@@ -5,7 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title BatchTokenDistributor
 /// @notice 专门用于批量向多个地址一次性发放 ERC20 代币的合约
@@ -18,7 +18,7 @@ contract BatchTokenDistributor is Ownable, ReentrancyGuard {
     event ERC20Rescued(address indexed token, address indexed to, uint256 amount);
     event ERC721Rescued(address indexed token, address indexed to, uint256 tokenId);
 
-    constructor(IERC20 _token) {
+    constructor(IERC20 _token) Ownable(msg.sender){
         require(address(_token) != address(0), "token address is zero");
         token = _token;
     }
