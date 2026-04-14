@@ -4,7 +4,7 @@
 //
 // 支持1种NFT（Prompt），按权重分配PTC奖励。
 // 质押挖矿的总数量：30亿
-// 释放规则：第一年25%，第二年15%，第三年12%，第四年10%，第五年8%，从第六年开始把剩余数量按照每年释放50%逐年减半的逻辑释放。
+// 释放规则：第一年18%，第二年16%，第三年14%，第四年12%，第五年10%，从第六年开始把剩余数量按照每年释放50%逐年减半的逻辑释放。
 // 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。
 // 奖励分配：用户收益 = 总释放奖励 × 销售比例，剩余部分进入缓冲池。
 // 提现：管理员控制，用户不能自行提现，支持随时为用户提现全部奖励。
@@ -174,16 +174,16 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         // 奖励永远释放，无结束时间
 
         // Initialize schedule totals (单位: 亿 = 100,000,000)
-        // 第一年: 25% = 7.5亿
-        schedulePeriodTotals[0] = 750000000 ether;
-        // 第二年: 15% = 4.5亿
-        schedulePeriodTotals[1] = 450000000 ether;
-        // 第三年: 12% = 3.6亿
-        schedulePeriodTotals[2] = 360000000 ether;
-        // 第四年: 10% = 3亿
-        schedulePeriodTotals[3] = 300000000 ether;
-        // 第五年: 8% = 2.4亿
-        schedulePeriodTotals[4] = 240000000 ether;
+        // 第一年: 18% = 5.4亿
+        schedulePeriodTotals[0] = 540000000 ether;
+        // 第二年: 16% = 4.8亿
+        schedulePeriodTotals[1] = 480000000 ether;
+        // 第三年: 14% = 4.2亿
+        schedulePeriodTotals[2] = 420000000 ether;
+        // 第四年: 12% = 3.6亿
+        schedulePeriodTotals[3] = 360000000 ether;
+        // 第五年: 10% = 3亿
+        schedulePeriodTotals[4] = 300000000 ether;
         // 第六年及以后: 动态释放
         schedulePeriodTotals[5] = 0;
     }
