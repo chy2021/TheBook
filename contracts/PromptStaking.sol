@@ -8,6 +8,7 @@
 // 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。
 // 奖励分配：用户收益 = 总释放奖励 × 销售比例，剩余部分进入缓冲池。
 // 提现：管理员控制，用户不能自行提现，支持随时为用户提现全部奖励。
+// 平台代扣：管理员可将单个或多个用户的待领取奖励直接划转至预先配置的平台收款账户，无手续费。
 // 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
@@ -53,6 +54,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     error BufferPoolNotSet();
     error InsufficientBufferPool();
     error TooEarlyForAdditional();
+    error PlatformReceiverNotSet();
+    error EmptyUserList();
 
     // -------------------- 质押结构体 --------------------
     /// @notice 用户单个NFT质押信息
@@ -117,6 +120,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
 
+    // -------------------- 平台代扣款参数 --------------------
+    address public platformPaymentReceiver; // 平台代扣款收款账户地址
+    uint256 public totalPlatformCharged;    // 全局累计平台代扣总量（PTC）
+
     // -------------------- 缓冲池提现延迟参数 --------------------
     uint256 public constant BUFFER_WITHDRAWAL_DELAY = 1 days; // 缓冲池提取延迟时间
 
@@ -155,6 +162,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event SalesRatioUpdateResumed(address indexed admin);
     event AdditionalRewardAdded(address indexed admin, uint256 amount);
     event FeeRecipientSet(address indexed admin, address newFeeRecipient);
+    event PlatformPaymentReceiverSet(address indexed admin, address newReceiver);
+    event PlatformCharged(address indexed user, address indexed receiver, uint256 amount);
     
     // -------------------- 构造函数 --------------------
     /// @notice 构造函数，初始化PTC和NFT合约地址及奖励起始时间
@@ -706,6 +715,57 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (_feeRecipient == address(0)) revert ZeroAddress();
         feeRecipient = _feeRecipient;
         emit FeeRecipientSet(msg.sender, _feeRecipient);
+    }
+
+    /// @notice 设置平台代扣款收款账户地址
+    /// @param _receiver 新的平台收款地址
+    function setPlatformPaymentReceiver(address _receiver) external onlyOwner {
+        if (_receiver == address(0)) revert ZeroAddress();
+        platformPaymentReceiver = _receiver;
+        emit PlatformPaymentReceiverSet(msg.sender, _receiver);
+    }
+
+    /// @dev 内部代扣逻辑：将用户 amount 的待领取奖励转入平台收款账户（无手续费）
+    /// @param user 被代扣的用户地址
+    /// @param amount 代扣金额（必须 >0 且 <= 用户 pendingReward）
+    function _chargeUser(address user, uint256 amount) internal {
+        UserInfo storage u = users[user];
+        if (amount > u.pendingReward) revert AmountExceedsPending();
+
+        u.pendingReward -= amount;
+        totalPendingReward -= amount;
+        u.claimed += amount;
+        totalClaimedPTC += amount;
+        totalPlatformCharged += amount;
+
+        emit PlatformCharged(user, platformPaymentReceiver, amount);
+        ptc.safeTransfer(platformPaymentReceiver, amount);
+    }
+
+    /// @notice 管理员代扣单个用户指定数量奖励至平台收款账户（无手续费）
+    /// @param user 被代扣的用户地址
+    /// @param amount 代扣金额
+    function chargeUser(address user, uint256 amount) external nonReentrant whenNotPaused onlyOwner {
+        if (platformPaymentReceiver == address(0)) revert PlatformReceiverNotSet();
+        if (amount == 0) revert AmountZero();
+        _updateReward(user);
+        _chargeUser(user, amount);
+    }
+
+    /// @notice 管理员批量代扣多个用户指定数量奖励至平台收款账户（无手续费）
+    /// @param _users 被代扣的用户地址数组
+    /// @param amounts 对应每个用户的代扣金额数组
+    function chargeUsers(address[] calldata _users, uint256[] calldata amounts) external nonReentrant whenNotPaused onlyOwner {
+        if (platformPaymentReceiver == address(0)) revert PlatformReceiverNotSet();
+        if (_users.length != amounts.length) revert LengthMismatch();
+        if (_users.length == 0) revert EmptyUserList();
+        for (uint256 i = 0; i < _users.length; i++) {
+            uint256 amount = amounts[i];
+            if (amount == 0) revert AmountZero();
+            address user = _users[i];
+            _updateReward(user);
+            _chargeUser(user, amount);
+        }
     }
 
     /// @notice 合约暂停（仅owner可调）

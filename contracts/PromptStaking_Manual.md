@@ -25,7 +25,7 @@
 | 依赖 | OpenZeppelin v5 (Ownable, ReentrancyGuard, Pausable, ERC721Holder, SafeERC20) |
 | 许可证 | MIT |
 
-**核心机制**：用户质押 Prompt NFT 获取 PTC 代币奖励。奖励按全局积分累加器模型（MasterChef 模式）分配，每个 NFT 权重相同。管理员控制提现操作。
+**核心机制**：用户质押 Prompt NFT 获取 PTC 代币奖励。奖励按全局积分累加器模型（MasterChef 模式）分配，每个 NFT 权重相同。管理员控制提现操作，并支持将用户的待领取奖励直接代扣至平台收款账户用于平台消费（无手续费）。
 
 ---
 
@@ -43,6 +43,7 @@
 | 销售地址 | 持有未售出 NFT 的地址 | EOA 或合约 |
 | 缓冲池地址 | 接收未分配奖励的地址 | EOA 或合约 |
 | NFT 发行总数 | Prompt NFT 的总发行量 | uint256 |
+| 平台收款账户 | 接收平台代扣款的地址（部署后由 Owner 单独设置） | EOA 或合约 |
 
 ### 2.2 构造函数参数
 
@@ -98,7 +99,16 @@ schedulePeriodTotals(3)  → 360000000000000000000000000 (3.6亿 ether)
 schedulePeriodTotals(4)  → 300000000000000000000000000 (3.0亿 ether)
 ```
 
-**第四步：转移 Owner 至多签钱包**
+**第四步：配置平台收款账户（可选，需启用平台代扣时必做）**
+
+```solidity
+setPlatformPaymentReceiver(platformReceiverAddress)
+```
+
+- 部署时 `platformPaymentReceiver` 默认为零地址，此时 `chargeUser` / `chargeUsers` 调用将 revert
+- 设置非零地址后，Owner 才能调用平台代扣接口
+
+**第五步：转移 Owner 至多签钱包**
 
 ```solidity
 transferOwnership(multisigAddress)
@@ -126,6 +136,7 @@ transferOwnership(multisigAddress)
 |------|----------|------|
 | `feeRecipient` | `setFeeRecipient(address)` | onlyOwner |
 | `bufferPool` | `setBufferPool(address)` | onlyOwner |
+| `platformPaymentReceiver` | `setPlatformPaymentReceiver(address)` | onlyOwner |
 | `salesRatioUpdatePaused` | `emergencyPauseSalesRatioUpdate()` / `resumeSalesRatioUpdate()` | onlyOwner |
 | 合约暂停状态 | `pause()` / `unpause()` | onlyOwner |
 
@@ -227,6 +238,22 @@ transferOwnership(multisigAddress)
 
 **feeRate 说明**：单位 1/10000。100 = 1%，500 = 5%，10000 = 100%。
 
+#### 平台代扣款操作（用于用户在平台消费）
+
+| 函数 | 说明 |
+|------|------|
+| `chargeUser(address user, uint256 amount)` | 将单个用户指定数量的待领取奖励直接划转至平台收款账户 |
+| `chargeUsers(address[] _users, uint256[] amounts)` | 批量为多个用户按各自指定数量进行代扣 |
+
+**特性说明**：
+
+- **无手续费**：全额转入 `platformPaymentReceiver`，不抽取任何比例
+- **仅扣待领取部分**：从用户 `pendingReward` 中扣减，不会影响其已质押的 NFT
+- **必须预先设置**：调用前须通过 `setPlatformPaymentReceiver` 配置平台收款账户，否则 revert `PlatformReceiverNotSet`
+- **会计口径**：代扣金额会累加到用户 `claimed`、全局 `totalClaimedPTC` 以及独立统计的 `totalPlatformCharged`
+- **修饰符**：`onlyOwner`、`nonReentrant`、`whenNotPaused`
+- **金额要求**：`amount` 必须 > 0 且 ≤ 用户当前 `pendingReward`（结算后）
+
 #### 平台解押
 
 | 函数 | 说明 |
@@ -247,6 +274,7 @@ transferOwnership(multisigAddress)
 |------|------|
 | `setFeeRecipient(address)` | 设置手续费接收地址 |
 | `setBufferPool(address)` | 设置缓冲池地址 |
+| `setPlatformPaymentReceiver(address)` | 设置平台代扣款收款账户地址 |
 | `emergencyPauseSalesRatioUpdate()` | 紧急暂停销售比例更新 |
 | `resumeSalesRatioUpdate()` | 恢复销售比例更新 |
 | `pause()` | 暂停合约（阻止质押/解押/提现等常规操作） |
@@ -291,6 +319,8 @@ transferOwnership(multisigAddress)
 | `getTotalAllocatedPTC()` | `uint256` | 已分配给用户的 PTC 总量（含实时未结算部分） |
 | `emittedUntil(uint256 t)` | `uint256` | 从开始到时间 t 的累计释放量 |
 | `getProtectedSalesRatioView()` | `uint256` | 当前销售比例（1e18 精度） |
+| `platformPaymentReceiver()` | `address` | 当前平台代扣款收款账户 |
+| `totalPlatformCharged()` | `uint256` | 全局累计平台代扣总量（PTC） |
 
 #### `getSystemStats()` 返回值明细
 
@@ -338,7 +368,35 @@ withdrawForUsers(
 )
 ```
 
-### 5.2 缓冲池提现操作（两步走 + 1 天等待期）
+### 5.2 平台代扣款操作（用户在平台消费）
+
+**使用前置条件**：必须先通过 `setPlatformPaymentReceiver` 配置平台收款账户。
+
+**设置平台收款账户（首次使用或变更时）：**
+```solidity
+setPlatformPaymentReceiver(platformReceiverAddress)
+```
+
+**为单个用户代扣指定金额（无手续费）：**
+```solidity
+chargeUser(userAddress, 500 ether)
+```
+
+**批量代扣多个用户指定金额（无手续费，每人金额可不同）：**
+```solidity
+chargeUsers(
+    [user1, user2, user3],
+    [500 ether, 200 ether, 1000 ether]
+)
+```
+
+**注意事项**：
+
+- 代扣金额会从用户 `pendingReward` 扣减，并累加至 `claimed`、`totalClaimedPTC`、`totalPlatformCharged`
+- 与 `withdrawForUser` 相比无手续费，PTC 全额进入 `platformPaymentReceiver`
+- 若某个用户的 `pendingReward` 不足 `amount`，整笔交易 revert（`AmountExceedsPending`），请先调用 `claimable(user)` 查询后再下发
+
+### 5.3 缓冲池提现操作（两步走 + 1 天等待期）
 
 ```
 第一步：requestBufferWithdrawal(amount)   → 发起请求
@@ -348,7 +406,7 @@ withdrawForUsers(
 如需取消：cancelBufferWithdrawal()
 ```
 
-### 5.3 第 6 年后注入额外奖励
+### 5.4 第 6 年后注入额外奖励
 
 ```
 第一步：ptc.approve(stakingContract, amount)   → 授权 PTC
@@ -357,7 +415,7 @@ withdrawForUsers(
 
 注入的金额将与剩余的 9 亿 PTC 合并，按 50% 年减半规则继续释放。
 
-### 5.4 平台强制解押
+### 5.5 平台强制解押
 
 适用场景：到期回收、司法要求、合规需要。
 
@@ -384,6 +442,8 @@ unstakeBatchPlatform([tokenId1, tokenId2, tokenId3])
 | `BufferPoolWithdrawn` | `admin(indexed), amount` | 执行缓冲池提现 |
 | `BufferPoolSet` | `admin(indexed), newBufferPool` | 设置缓冲池地址 |
 | `FeeRecipientSet` | `admin(indexed), newFeeRecipient` | 设置手续费地址 |
+| `PlatformPaymentReceiverSet` | `admin(indexed), newReceiver` | 设置平台代扣收款账户 |
+| `PlatformCharged` | `user(indexed), receiver(indexed), amount` | 平台代扣款执行 |
 | `SalesRatioUpdatePaused` | `admin(indexed)` | 暂停销售比例更新 |
 | `SalesRatioUpdateResumed` | `admin(indexed)` | 恢复销售比例更新 |
 | `AdditionalRewardAdded` | `admin(indexed), amount` | 注入额外奖励 |
@@ -419,6 +479,8 @@ unstakeBatchPlatform([tokenId1, tokenId2, tokenId3])
 | `BufferPoolNotSet` | 缓冲池地址未设置 |
 | `InsufficientBufferPool` | 缓冲池余额不足 |
 | `TooEarlyForAdditional` | 尚未到第 6 年，不能注入额外奖励 |
+| `PlatformReceiverNotSet` | 未设置 `platformPaymentReceiver` 就调用代扣接口 |
+| `EmptyUserList` | 平台代扣的批量用户数组为空 |
 
 ---
 
@@ -438,6 +500,9 @@ emittedUntil(now) ≈ bufferPoolReward + totalClaimedPTC + totalFeesPaid + total
 emittedUntil(block.timestamp)  ≈  getTotalAllocatedPTC() + bufferPoolReward + totalFeesPaid
 ```
 
+> 说明：`totalClaimedPTC` 已同时包含「用户直接领取净额」与「平台代扣总额」。如需单独核对平台消费，可用：
+> `totalPlatformCharged ≤ totalClaimedPTC`
+
 ### 8.2 PTC 余额充裕性监控
 
 ```
@@ -455,6 +520,7 @@ ptc.balanceOf(stakingContract)  ≥  totalPendingReward + bufferPoolReward
 | 总质押 NFT 数 | `totalStakeCount` | 质押率趋势 |
 | 累计已发放 PTC | `totalClaimedPTC` | 发放进度 |
 | 累计手续费 | `totalFeesPaid` | 手续费收入 |
+| 累计平台代扣 | `totalPlatformCharged` | 平台消费代扣规模（已含在 `totalClaimedPTC` 内） |
 | 缓冲池累计 | `bufferPoolReward` | 未分配奖励规模 |
 | 待领取总量 | `totalPendingReward` | 用户未提现的奖励规模 |
 | 合约 PTC 余额 | `ptc.balanceOf(contract)` | 余额充裕性 |
@@ -518,10 +584,11 @@ emittedUntil(startRewardTimestamp + 2555 days) = 2,775,000,000 ether (第7年末
 Owner 拥有以下重要权限，必须通过多签钱包管控：
 
 - 为用户提现（可设置任意手续费率，最高 100%）
+- 将用户的待领取奖励代扣至平台收款账户（无手续费，用于平台消费场景）
 - 暂停/恢复合约
 - 强制解押用户的 NFT
 - 提取缓冲池资金
-- 修改手续费接收地址和缓冲池地址
+- 修改手续费接收地址、缓冲池地址、平台代扣款收款账户
 - 救援合约内的其他代币/ETH
 
 **强烈建议**：部署后立即将 Owner 转移至 Gnosis Safe 多签钱包（至少 3/5）。
@@ -547,6 +614,7 @@ Owner 拥有以下重要权限，必须通过多签钱包管控：
 | `stakeBatch` | 100-200 个 | 受 NFT 转账 gas 成本限制 |
 | `unstakeBatch` | 100-200 个 | 受 NFT 转账 gas 成本限制 |
 | `withdrawForUsers` | 200-500 个 | 受 PTC 转账 gas 成本限制 |
+| `chargeUsers` | 200-500 个 | 受 PTC 转账 gas 成本限制 |
 | `unstakeBatchPlatform` | 100-200 个 | 受 NFT 转账 gas 成本限制 |
 
 建议上线前在目标链上实测确定最优批量大小。
