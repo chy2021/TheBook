@@ -7,8 +7,9 @@
 // 释放规则：第一年18%，第二年16%，第三年14%，第四年12%，第五年10%，从第六年开始把剩余数量按照每年释放50%逐年减半的逻辑释放。
 // 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。
 // 奖励分配：用户收益 = 总释放奖励 × 销售比例，剩余部分进入缓冲池。
-// 提现：管理员控制，用户不能自行提现，支持随时为用户提现全部奖励。
-// 平台代扣：管理员可将单个或多个用户的待领取奖励直接划转至预先配置的平台收款账户，无手续费。
+// 提现：分发操作员（distributor）控制，支持随时为用户提现全部奖励。
+// 平台代扣：分发操作员可将单个或多个用户的待领取奖励直接划转至预先配置的平台收款账户，无手续费。
+// 权限分离：owner负责合约管理（暂停/恢复、设置参数、救援资产），distributor负责日常奖励分发和代扣。
 // 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
@@ -24,11 +25,11 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 /// @title PromptStaking
 /// @author Thebook
-contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
+contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     // -------------------- Custom Errors --------------------
@@ -44,11 +45,9 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     error NoClaimable();
     error AmountZero();
     error AmountExceedsPending();
-    error InsufficientBalance();
     error LengthMismatch();
     error CannotRescuePTC();
     error CannotRescueStakedNFT();
-    error TransferFailed();
     error NoPendingWithdrawal();
     error WithdrawalDelayNotMet();
     error BufferPoolNotSet();
@@ -56,6 +55,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     error TooEarlyForAdditional();
     error PlatformReceiverNotSet();
     error EmptyUserList();
+    error NotDistributor();
+    error UnsolicitedNFTTransfer();
 
     // -------------------- 质押结构体 --------------------
     /// @notice 用户单个NFT质押信息
@@ -91,8 +92,13 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public constant MAX_DYNAMIC_YEARS = 100; // 第6年后动态释放的最大年数上限，防止循环耗尽gas
     uint256 public constant MAX_FEE_RATE = 10000; // 手续费率上限 100%
 
-    // 第6年后的额外注入奖励
-    uint256 public additionalRewardAfter5Years;
+    // 第6年后的额外注入奖励（按注入时间前向生效，不回溯历史区间）
+    struct AdditionalInjection {
+        uint256 amount;     // 注入金额
+        uint256 fromYear;   // 生效起始年索引（相对于start6，0=第6年，1=第7年...）
+    }
+    AdditionalInjection[] public additionalInjections;
+    uint256 public totalAdditionalReward; // 累计注入总量（便于查询）
 
     // 释放周期：前5年固定，第6年开始动态释放
     uint256 public constant SCHEDULE_PERIOD_DURATION = 365 days;
@@ -120,6 +126,9 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
 
+    // -------------------- 分发权参数 --------------------
+    address public distributor; // 奖励分发操作员地址（独立于owner）
+
     // -------------------- 平台代扣款参数 --------------------
     address public platformPaymentReceiver; // 平台代扣款收款账户地址
     uint256 public totalPlatformCharged;    // 全局累计平台代扣总量（PTC）
@@ -127,9 +136,15 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     // -------------------- 缓冲池提现延迟参数 --------------------
     uint256 public constant BUFFER_WITHDRAWAL_DELAY = 1 days; // 缓冲池提取延迟时间
 
-    // -------------------- 销售比例保护参数 --------------------
-    uint256 private lastSalesRatioUpdate; // 上次销售比例更新时间
-    uint256 private cachedSalesRatio; // 缓存的销售比例（1e18精度）
+    // -------------------- 销售比例参数 --------------------
+    uint256 public salesRatio; // 销售比例（1e18精度），由owner通过updateSalesRatio设置
+    uint256 public constant MAX_SALES_RATIO = 1e18; // 销售比例上限 100%
+
+    // -------------------- 权限修饰符 --------------------
+    modifier onlyDistributor() {
+        if (msg.sender != distributor) revert NotDistributor();
+        _;
+    }
 
     // -------------------- 紧急控制参数 --------------------
     bool public salesRatioUpdatePaused; // 销售比例更新暂停标志
@@ -153,7 +168,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event EmergencyUnstake(address indexed user, uint256 indexed tokenId);
     event ERC20Rescued(address indexed operator, address token, uint256 amount);
     event ERC721Rescued(address indexed operator, address nft, uint256 tokenId);
-    event GASRescued(address indexed operator, uint256 amount);
     event BufferPoolWithdrawn(address indexed admin, uint256 amount);
     event BufferPoolSet(address indexed admin, address newBufferPool);
     event BufferPoolWithdrawalRequested(address indexed admin, uint256 amount, uint256 requestTime);
@@ -161,6 +175,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     event SalesRatioUpdatePaused(address indexed admin);
     event SalesRatioUpdateResumed(address indexed admin);
     event AdditionalRewardAdded(address indexed admin, uint256 amount);
+    event DistributorSet(address indexed admin, address newDistributor);
     event FeeRecipientSet(address indexed admin, address newFeeRecipient);
     event PlatformPaymentReceiverSet(address indexed admin, address newReceiver);
     event PlatformCharged(address indexed user, address indexed receiver, uint256 amount);
@@ -174,6 +189,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     /// @param _totalNFTSupply NFT发行总数
     /// @param _salesAddress 销售地址
     /// @param _bufferPool 缓冲池地址
+    /// @param _distributor 分发操作员地址
     constructor(
         address _ptc,
         address _promptNFT,
@@ -181,7 +197,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         address _feeRecipient,
         uint256 _totalNFTSupply,
         address _salesAddress,
-        address _bufferPool
+        address _bufferPool,
+        address _distributor
     ) Ownable(msg.sender)
     {
         if (_ptc == address(0)) revert ZeroAddress();
@@ -189,11 +206,13 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (_feeRecipient == address(0)) revert ZeroAddress();
         if (_salesAddress == address(0)) revert ZeroAddress();
         if (_bufferPool == address(0)) revert ZeroAddress();
+        if (_distributor == address(0)) revert ZeroAddress();
         if (_totalNFTSupply == 0) revert InvalidSupply();
 
         ptc = IERC20(_ptc);
         promptNFT = _promptNFT;
         feeRecipient = _feeRecipient;
+        distributor = _distributor;
         totalNFTSupply = _totalNFTSupply;
         salesAddress = _salesAddress;
         bufferPool = _bufferPool;
@@ -367,23 +386,55 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
             total += schedulePeriodTotals[i] * elapsed / periodDuration;
         }
-        // 从第六年开始动态释放
+        // 从第六年开始动态释放（基础9亿 + 各笔注入按各自生效年份前向释放）
         uint256 start6 = startRewardTimestamp + 5 * periodDuration;
         if (t > start6) {
-            uint256 remaining = REMAINING_AFTER_5_YEARS + additionalRewardAfter5Years;
-            uint256 yearsPassed = (t - start6) / periodDuration;
-            uint256 maxYears = yearsPassed < MAX_DYNAMIC_YEARS ? yearsPassed : MAX_DYNAMIC_YEARS;
-            for (uint256 y = 0; y <= maxYears && remaining > 0; y++) {
-                uint256 releaseThisYear = remaining * FRACTION / 10000;
-                uint256 periodStart = start6 + y * periodDuration;
-                if (t <= periodStart) break;
-                uint256 periodEnd = periodStart + periodDuration;
-                uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
-                total += releaseThisYear * elapsed / periodDuration;
-                remaining -= releaseThisYear;
+            total += _emittedTail(t, start6, periodDuration, REMAINING_AFTER_5_YEARS, 0);
+            uint256 injLen = additionalInjections.length;
+            for (uint256 j = 0; j < injLen; j++) {
+                AdditionalInjection storage inj = additionalInjections[j];
+                total += _emittedTail(t, start6, periodDuration, inj.amount, inj.fromYear);
             }
         }
         return total;
+    }
+
+    /// @dev 计算单笔资金池从 fromYear 开始按50%减半释放到时间 t 的累计释放量
+    /// @param t 目标时间
+    /// @param start6 第6年起始时间戳
+    /// @param periodDuration 每年时长
+    /// @param initialRemaining 该笔资金池初始总量
+    /// @param fromYear 该笔资金开始参与释放的年索引（0=第6年）
+    function _emittedTail(
+        uint256 t,
+        uint256 start6,
+        uint256 periodDuration,
+        uint256 initialRemaining,
+        uint256 fromYear
+    ) internal pure returns (uint256) {
+        uint256 yearsPassed = (t - start6) / periodDuration;
+        uint256 maxYears = yearsPassed < MAX_DYNAMIC_YEARS ? yearsPassed : MAX_DYNAMIC_YEARS;
+        if (maxYears < fromYear) return 0;
+
+        uint256 remaining = initialRemaining;
+        for (uint256 y = 0; y < fromYear && remaining > 0; y++) {
+            uint256 dec = remaining * FRACTION / 10000;
+            if (dec == 0) break;
+            remaining -= dec;
+        }
+
+        uint256 emitted = 0;
+        for (uint256 y = fromYear; y <= maxYears && remaining > 0; y++) {
+            uint256 releaseThisYear = remaining * FRACTION / 10000;
+            if (releaseThisYear == 0) break;
+            uint256 periodStart = start6 + y * periodDuration;
+            if (t <= periodStart) break;
+            uint256 periodEnd = periodStart + periodDuration;
+            uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
+            emitted += releaseThisYear * elapsed / periodDuration;
+            remaining -= releaseThisYear;
+        }
+        return emitted;
     }
 
     /// @dev 更新指定用户的奖励，在质押/解押/提现前调用
@@ -464,6 +515,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
     
     /// @notice 批量解押NFT
+    /// @dev 循环中每次safeTransferFrom回调时，外部view调用可能观察到中间状态（已处理的NFT已移除，未处理的仍存在）。
+    ///      nonReentrant已阻止状态变更重入，集成方应避免在onERC721Received回调中依赖本合约的view快照。
     function unstakeBatch(uint256[] calldata tokenIds) external nonReentrant whenNotPaused {
         if (tokenIds.length == 0) revert NoTokenIds();
         _updateReward(msg.sender);
@@ -477,7 +530,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
 
     /// @notice 一键解押用户所有NFT
-    /// 注意：用户质押nft数量太多可能导致gas高甚至超过上限而无法执行
+    /// @dev 注意：用户质押nft数量太多可能导致gas高甚至超过上限而无法执行。
+    ///      循环中每次safeTransferFrom回调时，外部view调用可能观察到中间状态，集成方应避免在回调中依赖本合约的view快照。
     function unstakeAll() external nonReentrant whenNotPaused {
         _updateReward(msg.sender);
         StakeInfo[] storage stakes = users[msg.sender].stakes;
@@ -494,10 +548,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         totalStakeCount -= count;
     }
 
-    /// @notice 管理员为用户提现所有可领取的PTC奖励（扣除手续费）
+    /// @notice 分发操作员为用户提现所有可领取的PTC奖励（扣除手续费）
     /// @param user 用户地址
     /// @param feeRate 手续费率，单位1e4（100=1%）
-    function withdrawForUser(address user, uint256 feeRate) external nonReentrant whenNotPaused onlyOwner {
+    function withdrawForUser(address user, uint256 feeRate) external nonReentrant whenNotPaused onlyDistributor {
         if (feeRate > MAX_FEE_RATE) revert FeeRateTooHigh();
         _updateReward(user);
         UserInfo storage u = users[user];
@@ -520,11 +574,11 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (fee > 0) ptc.safeTransfer(feeRecipient, fee);
     }
 
-    /// @notice 管理员为用户提现指定数量的PTC奖励（扣除手续费）
+    /// @notice 分发操作员为用户提现指定数量的PTC奖励（扣除手续费）
     /// @param user 用户地址
     /// @param amount 提现金额
     /// @param feeRate 手续费率，单位1e4（100=1%）
-    function withdrawForUser(address user, uint256 amount, uint256 feeRate) external nonReentrant whenNotPaused onlyOwner {
+    function withdrawForUser(address user, uint256 amount, uint256 feeRate) external nonReentrant whenNotPaused onlyDistributor {
         if (feeRate > MAX_FEE_RATE) revert FeeRateTooHigh();
         _updateReward(user);
         UserInfo storage u = users[user];
@@ -546,10 +600,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         if (fee > 0) ptc.safeTransfer(feeRecipient, fee);
     }
 
-    /// @notice 管理员批量为用户提现所有可领取的PTC奖励（扣除手续费）
+    /// @notice 分发操作员批量为用户提现所有可领取的PTC奖励（扣除手续费）
     /// @param _users 用户地址数组
     /// @param feeRates 手续费率数组，单位1e4（100=1%），对应每个用户
-    function withdrawForUsers(address[] calldata _users, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyOwner {
+    function withdrawForUsers(address[] calldata _users, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyDistributor {
         if (_users.length != feeRates.length) revert LengthMismatch();
         for (uint256 i = 0; i < _users.length; i++) {
             if (feeRates[i] > MAX_FEE_RATE) revert FeeRateTooHigh();
@@ -579,11 +633,11 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         }
     }
 
-    /// @notice 管理员批量为用户提现指定数量的PTC奖励（扣除手续费）
+    /// @notice 分发操作员批量为用户提现指定数量的PTC奖励（扣除手续费）
     /// @param _users 用户地址数组
     /// @param amounts 提现金额数组，对应每个用户
     /// @param feeRates 手续费率数组，单位1e4（100=1%），对应每个用户
-    function withdrawForUsers(address[] calldata _users, uint256[] calldata amounts, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyOwner {
+    function withdrawForUsers(address[] calldata _users, uint256[] calldata amounts, uint256[] calldata feeRates) external nonReentrant whenNotPaused onlyDistributor {
         if (_users.length != amounts.length || amounts.length != feeRates.length) revert LengthMismatch();
         for (uint256 i = 0; i < feeRates.length; i++) {
             if (feeRates[i] > MAX_FEE_RATE) revert FeeRateTooHigh();
@@ -643,14 +697,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         IERC20(token).safeTransfer(owner(), amount);
     }
 
-    /// @notice 救援合约内误转入的主网币
-    function rescueGAS(uint256 amount) external nonReentrant onlyOwner {
-        if (amount > address(this).balance) revert InsufficientBalance();
-        emit GASRescued(msg.sender, amount);
-        (bool success, ) = owner().call{value: amount}("");
-        if (!success) revert TransferFailed();
-    }
-
     /// @notice 救援合约内误转入的ERC721 NFT（禁止Prompt质押NFT）
     function rescueERC721(address nft, uint256 tokenId) external nonReentrant onlyOwner {
         if (nft == promptNFT) revert CannotRescueStakedNFT();
@@ -659,10 +705,18 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         IERC721(nft).safeTransferFrom(address(this), owner(), tokenId);
     }
 
-    /// @notice 用户紧急批量解押（仅暂停时可用，不结算奖励，保留 rewardDebt 以便恢复后继续领取）
+    /// @notice 用户紧急批量解押（仅暂停时可用，基于已有accRewardPerWeight结算奖励到pendingReward后再解押）
     function emergencyUnstakeBatch(uint256 count) external nonReentrant whenPaused {
-        StakeInfo[] storage stakes = users[msg.sender].stakes;
+        UserInfo storage u = users[msg.sender];
+        StakeInfo[] storage stakes = u.stakes;
         if (stakes.length == 0) revert NoStaked();
+        uint256 stakeCount = stakes.length;
+        if (stakeCount > 0 && accRewardPerWeight > u.rewardDebt) {
+            uint256 pending = stakeCount * (accRewardPerWeight - u.rewardDebt) / 1e18;
+            u.pendingReward += pending;
+            totalPendingReward += pending;
+        }
+        u.rewardDebt = accRewardPerWeight;
         uint256 n = count > stakes.length ? stakes.length : count;
         for (uint256 i = 0; i < n; i++) {
             uint256 idx = stakes.length - 1;
@@ -676,10 +730,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         totalStakeCount -= n;
     }
 
-    /// @notice 平台管理员（owner）随时解押任意NFT返回至原质押用户（含结算）
-    /// @dev 仅owner可调，无需用户授权，适用于特殊情况（如到期、司法、合规等）
+    /// @notice 分发操作员随时解押任意NFT返回至原质押用户（含结算）
+    /// @dev 仅distributor可调，无需用户授权，适用于特殊情况（如到期、司法、合规等）
     /// @param tokenIds NFT编号列表
-    function unstakeBatchPlatform(uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlyOwner {
+    function unstakeBatchPlatform(uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlyDistributor {
         if (tokenIds.length == 0) revert NoTokenIds();
         _updateGlobal();
         address lastUser = address(0);
@@ -717,6 +771,14 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         emit FeeRecipientSet(msg.sender, _feeRecipient);
     }
 
+    /// @notice 设置分发操作员地址（仅owner可调）
+    /// @param _distributor 新的分发操作员地址
+    function setDistributor(address _distributor) external onlyOwner {
+        if (_distributor == address(0)) revert ZeroAddress();
+        distributor = _distributor;
+        emit DistributorSet(msg.sender, _distributor);
+    }
+
     /// @notice 设置平台代扣款收款账户地址
     /// @param _receiver 新的平台收款地址
     function setPlatformPaymentReceiver(address _receiver) external onlyOwner {
@@ -742,20 +804,20 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         ptc.safeTransfer(platformPaymentReceiver, amount);
     }
 
-    /// @notice 管理员代扣单个用户指定数量奖励至平台收款账户（无手续费）
+    /// @notice 分发操作员代扣单个用户指定数量奖励至平台收款账户（无手续费）
     /// @param user 被代扣的用户地址
     /// @param amount 代扣金额
-    function chargeUser(address user, uint256 amount) external nonReentrant whenNotPaused onlyOwner {
+    function chargeUser(address user, uint256 amount) external nonReentrant whenNotPaused onlyDistributor {
         if (platformPaymentReceiver == address(0)) revert PlatformReceiverNotSet();
         if (amount == 0) revert AmountZero();
         _updateReward(user);
         _chargeUser(user, amount);
     }
 
-    /// @notice 管理员批量代扣多个用户指定数量奖励至平台收款账户（无手续费）
+    /// @notice 分发操作员批量代扣多个用户指定数量奖励至平台收款账户（无手续费）
     /// @param _users 被代扣的用户地址数组
     /// @param amounts 对应每个用户的代扣金额数组
-    function chargeUsers(address[] calldata _users, uint256[] calldata amounts) external nonReentrant whenNotPaused onlyOwner {
+    function chargeUsers(address[] calldata _users, uint256[] calldata amounts) external nonReentrant whenNotPaused onlyDistributor {
         if (platformPaymentReceiver == address(0)) revert PlatformReceiverNotSet();
         if (_users.length != amounts.length) revert LengthMismatch();
         if (_users.length == 0) revert EmptyUserList();
@@ -825,14 +887,38 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         emit BufferPoolWithdrawn(msg.sender, amount);
     }
 
-    /// @notice 管理员注入额外奖励（第6年后的减半发放总量）
+    /// @notice 管理员注入额外奖励（第6年后的减半发放总量，仅从下一个完整年度开始前向释放，不回溯历史）
     /// @param amount 注入的PTC金额
     function addAdditionalReward(uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert AmountZero();
-        if (block.timestamp < startRewardTimestamp + 5 * SCHEDULE_PERIOD_DURATION) revert TooEarlyForAdditional();
+        uint256 start6 = startRewardTimestamp + 5 * SCHEDULE_PERIOD_DURATION;
+        if (block.timestamp < start6) revert TooEarlyForAdditional();
         _updateGlobal();
-        additionalRewardAfter5Years += amount;
+        uint256 fromYear = (block.timestamp - start6) / SCHEDULE_PERIOD_DURATION + 1;
+        additionalInjections.push(AdditionalInjection({
+            amount: amount,
+            fromYear: fromYear
+        }));
+        totalAdditionalReward += amount;
         ptc.safeTransferFrom(msg.sender, address(this), amount);
         emit AdditionalRewardAdded(msg.sender, amount);
+    }
+
+    /// @notice 查询额外注入记录数量
+    function getAdditionalInjectionsCount() external view returns (uint256) {
+        return additionalInjections.length;
+    }
+
+    /// @notice ERC721接收回调：promptNFT仅允许合约自身发起的转入（即通过stake流程），其他NFT无条件接受
+    function onERC721Received(
+        address operator,
+        address,
+        uint256,
+        bytes calldata
+    ) external view override returns (bytes4) {
+        if (msg.sender == promptNFT && operator != address(this)) {
+            revert UnsolicitedNFTTransfer();
+        }
+        return IERC721Receiver.onERC721Received.selector;
     }
 }
