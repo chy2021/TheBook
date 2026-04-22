@@ -537,6 +537,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
         StakeInfo[] storage stakes = users[msg.sender].stakes;
         if (stakes.length == 0) revert NoStaked();
         uint256 count = stakes.length;
+        totalStakeCount -= count;
         while (stakes.length > 0) {
             uint256 tid = stakes[stakes.length - 1].tokenId;
             stakes.pop();
@@ -545,7 +546,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
             emit Unstaked(msg.sender, tid);
             IERC721(promptNFT).safeTransferFrom(address(this), msg.sender, tid);
         }
-        totalStakeCount -= count;
     }
 
     /// @notice 分发操作员为用户提现所有可领取的PTC奖励（扣除手续费）
@@ -707,6 +707,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
 
     /// @notice 用户紧急批量解押（仅暂停时可用，基于已有accRewardPerWeight结算奖励到pendingReward后再解押）
     function emergencyUnstakeBatch(uint256 count) external nonReentrant whenPaused {
+        if (count == 0) revert AmountZero();
         UserInfo storage u = users[msg.sender];
         StakeInfo[] storage stakes = u.stakes;
         if (stakes.length == 0) revert NoStaked();
@@ -851,6 +852,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     /// @notice 管理员请求提现缓冲池奖励（时间锁保护）
     /// @param amount 请求提现的金额
     function requestBufferWithdrawal(uint256 amount) external onlyOwner {
+        _updateGlobal();
         if (amount == 0) revert AmountZero();
         if (amount > bufferPoolReward) revert InsufficientBufferPool();
         if (bufferPool == address(0)) revert BufferPoolNotSet();
