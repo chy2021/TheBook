@@ -22,10 +22,10 @@
 | 合约名 | `PromptStaking` |
 | 版本 | V4.0 |
 | Solidity | ^0.8.20 |
-| 依赖 | OpenZeppelin v5 (Ownable, ReentrancyGuard, Pausable, ERC721Holder, SafeERC20) |
+| 依赖 | OpenZeppelin v5 (Ownable, ReentrancyGuard, Pausable, IERC721Receiver, SafeERC20) |
 | 许可证 | MIT |
 
-**核心机制**：用户质押 Prompt NFT 获取 PTC 代币奖励。奖励按全局积分累加器模型（MasterChef 模式）分配，每个 NFT 权重相同。管理员控制提现操作，并支持将用户的待领取奖励直接代扣至平台收款账户用于平台消费（无手续费）。
+**核心机制**：用户质押 Prompt NFT 获取 PTC 代币奖励。奖励按全局积分累加器模型（MasterChef 模式）分配，每个 NFT 权重相同。合约采用**权限分离**架构：`owner` 负责合约管理（暂停/恢复、参数设置、资产救援），`distributor` 负责日常奖励分发和代扣操作。支持将用户的待领取奖励直接代扣至平台收款账户用于平台消费（无手续费）。合约拒绝未通过 `stake` 流程直接发送的 Prompt NFT，防止资产锁死。
 
 ---
 
@@ -43,6 +43,7 @@
 | 销售地址 | 持有未售出 NFT 的地址 | EOA 或合约 |
 | 缓冲池地址 | 接收未分配奖励的地址 | EOA 或合约 |
 | NFT 发行总数 | Prompt NFT 的总发行量 | uint256 |
+| 分发操作员地址 | 负责日常奖励分发和代扣的地址 | EOA 或合约 |
 | 平台收款账户 | 接收平台代扣款的地址（部署后由 Owner 单独设置） | EOA 或合约 |
 
 ### 2.2 构造函数参数
@@ -55,7 +56,8 @@ constructor(
     address _feeRecipient,  // 手续费接收地址（不可为零地址）
     uint256 _totalNFTSupply,// NFT 发行总数（必须 > 0）
     address _salesAddress,  // 销售地址（不可为零地址）
-    address _bufferPool     // 缓冲池地址（不可为零地址）
+    address _bufferPool,    // 缓冲池地址（不可为零地址）
+    address _distributor    // 分发操作员地址（不可为零地址）
 )
 ```
 
@@ -92,6 +94,7 @@ feeRecipient()           → 应返回手续费接收地址
 totalNFTSupply()         → 应返回 NFT 发行总数
 salesAddress()           → 应返回销售地址
 bufferPool()             → 应返回缓冲池地址
+distributor()            → 应返回分发操作员地址
 schedulePeriodTotals(0)  → 540000000000000000000000000 (5.4亿 ether)
 schedulePeriodTotals(1)  → 480000000000000000000000000 (4.8亿 ether)
 schedulePeriodTotals(2)  → 420000000000000000000000000 (4.2亿 ether)
@@ -106,7 +109,7 @@ setPlatformPaymentReceiver(platformReceiverAddress)
 ```
 
 - 部署时 `platformPaymentReceiver` 默认为零地址，此时 `chargeUser` / `chargeUsers` 调用将 revert
-- 设置非零地址后，Owner 才能调用平台代扣接口
+- 设置非零地址后，Distributor 才能调用平台代扣接口
 
 **第五步：转移 Owner 至多签钱包**
 
@@ -115,6 +118,8 @@ transferOwnership(multisigAddress)
 ```
 
 建议使用 Gnosis Safe 多签钱包（至少 3/5 签名）。
+
+> **权限分离说明**：`owner`（多签钱包）仅负责合约管理，`distributor`（可用热钱包）负责日常分发。即使 distributor 私钥泄露，攻击者也无法暂停合约、修改参数或救援资产。可通过 `setDistributor()` 随时更换分发操作员。
 
 ### 2.4 不可修改参数（immutable/constant）
 
@@ -135,6 +140,7 @@ transferOwnership(multisigAddress)
 | 参数 | 修改函数 | 权限 |
 |------|----------|------|
 | `feeRecipient` | `setFeeRecipient(address)` | onlyOwner |
+| `distributor` | `setDistributor(address)` | onlyOwner |
 | `bufferPool` | `setBufferPool(address)` | onlyOwner |
 | `platformPaymentReceiver` | `setPlatformPaymentReceiver(address)` | onlyOwner |
 | `salesRatioUpdatePaused` | `emergencyPauseSalesRatioUpdate()` / `resumeSalesRatioUpdate()` | onlyOwner |
@@ -157,7 +163,7 @@ transferOwnership(multisigAddress)
 
 ### 3.2 第 6 年起动态释放
 
-剩余 900,000,000 PTC（+ 管理员注入的额外金额）按每年释放年初剩余量的 50% 逐年减半：
+剩余 900,000,000 PTC 按每年释放年初剩余量的 50% 逐年减半。管理员可在第 6 年后注入额外奖励，每笔注入从注入时间的下一个完整年度开始独立参与减半释放（不回溯历史）：
 
 | 年份 | 年初剩余 | 当年释放 |
 |------|---------|---------|
@@ -222,10 +228,10 @@ transferOwnership(multisigAddress)
 紧急批量解押（仅合约暂停时可用）。
 
 - 修饰符：`nonReentrant`, `whenPaused`
-- 不结算奖励，保留 `rewardDebt` 以便恢复后正常领取
+- 基于已有 `accRewardPerWeight` 结算奖励到 `pendingReward` 后再解押，确保已积累奖励不丢失
 - `count` 控制每次解押数量，防止 gas 超限
 
-### 4.2 管理员接口（仅 Owner）
+### 4.2 分发操作员接口（仅 Distributor）
 
 #### 提现操作
 
@@ -251,14 +257,16 @@ transferOwnership(multisigAddress)
 - **仅扣待领取部分**：从用户 `pendingReward` 中扣减，不会影响其已质押的 NFT
 - **必须预先设置**：调用前须通过 `setPlatformPaymentReceiver` 配置平台收款账户，否则 revert `PlatformReceiverNotSet`
 - **会计口径**：代扣金额会累加到用户 `claimed`、全局 `totalClaimedPTC` 以及独立统计的 `totalPlatformCharged`
-- **修饰符**：`onlyOwner`、`nonReentrant`、`whenNotPaused`
+- **修饰符**：`onlyDistributor`、`nonReentrant`、`whenNotPaused`
 - **金额要求**：`amount` 必须 > 0 且 ≤ 用户当前 `pendingReward`（结算后）
 
 #### 平台解押
 
 | 函数 | 说明 |
 |------|------|
-| `unstakeBatchPlatform(uint256[] tokenIds)` | 管理员强制解押任意 NFT 返还给原质押用户（含结算） |
+| `unstakeBatchPlatform(uint256[] tokenIds)` | 分发操作员强制解押任意 NFT 返还给原质押用户（含结算） |
+
+### 4.3 管理员接口（仅 Owner）
 
 #### 缓冲池管理
 
@@ -273,6 +281,7 @@ transferOwnership(multisigAddress)
 | 函数 | 说明 |
 |------|------|
 | `setFeeRecipient(address)` | 设置手续费接收地址 |
+| `setDistributor(address)` | 设置分发操作员地址 |
 | `setBufferPool(address)` | 设置缓冲池地址 |
 | `setPlatformPaymentReceiver(address)` | 设置平台代扣款收款账户地址 |
 | `emergencyPauseSalesRatioUpdate()` | 紧急暂停销售比例更新 |
@@ -286,19 +295,20 @@ transferOwnership(multisigAddress)
 |------|------|
 | `rescueERC20(address token, uint256 amount)` | 救援误转入的 ERC20 代币（禁止 PTC） |
 | `rescueERC721(address nft, uint256 tokenId)` | 救援误转入的 ERC721 NFT（禁止 Prompt NFT） |
-| `rescueGAS(uint256 amount)` | 救援误转入的主网币 |
 
 #### 额外奖励注入
 
 | 函数 | 说明 |
 |------|------|
-| `addAdditionalReward(uint256 amount)` | 第 6 年后注入额外奖励，加入动态释放池 |
+| `addAdditionalReward(uint256 amount)` | 第 6 年后注入额外奖励，仅从下一个完整年度开始前向释放 |
 
 - 仅在 `startRewardTimestamp + 5年` 之后可调用
 - 调用前需先 `ptc.approve(stakingContract, amount)`
 - 会从调用者账户转入 PTC
+- **不回溯历史**：注入的金额从注入时间所在年度的下一个完整年度开始参与减半释放，不影响已过去年份的奖励计算
+- 支持多次注入，每笔注入独立按自身生效年份释放
 
-### 4.3 只读查询接口
+### 4.4 只读查询接口
 
 #### 用户查询
 
@@ -321,6 +331,10 @@ transferOwnership(multisigAddress)
 | `getProtectedSalesRatioView()` | `uint256` | 当前销售比例（1e18 精度） |
 | `platformPaymentReceiver()` | `address` | 当前平台代扣款收款账户 |
 | `totalPlatformCharged()` | `uint256` | 全局累计平台代扣总量（PTC） |
+| `getAdditionalInjectionsCount()` | `uint256` | 额外奖励注入次数 |
+| `additionalInjections(uint256 i)` | `(amount, fromYear)` | 第 i 笔额外注入详情 |
+| `totalAdditionalReward()` | `uint256` | 累计额外注入奖励总量 |
+| `distributor()` | `address` | 当前分发操作员地址 |
 
 #### `getSystemStats()` 返回值明细
 
@@ -339,7 +353,9 @@ transferOwnership(multisigAddress)
 
 ## 5. 管理员操作手册
 
-### 5.1 日常提现操作
+### 5.1 日常提现操作（由 Distributor 执行）
+
+> 以下操作均需使用 `distributor` 地址调用，`owner` 无权直接执行。
 
 **为单个用户提现全部奖励（3% 手续费）：**
 ```solidity
@@ -368,7 +384,7 @@ withdrawForUsers(
 )
 ```
 
-### 5.2 平台代扣款操作（用户在平台消费）
+### 5.2 平台代扣款操作（用户在平台消费，由 Distributor 执行）
 
 **使用前置条件**：必须先通过 `setPlatformPaymentReceiver` 配置平台收款账户。
 
@@ -413,9 +429,11 @@ chargeUsers(
 第二步：addAdditionalReward(amount)             → 注入奖励
 ```
 
-注入的金额将与剩余的 9 亿 PTC 合并，按 50% 年减半规则继续释放。
+每笔注入的金额独立存储为 `AdditionalInjection`，从注入时间的**下一个完整年度**开始参与 50% 年减半释放。不同时间点注入的金额各自独立释放，**不会回溯修改已经过去年份的奖励计算**。
 
-### 5.5 平台强制解押
+可通过 `getAdditionalInjectionsCount()` 查询注入次数，通过 `additionalInjections(i)` 查询每笔注入的金额和生效年份。
+
+### 5.5 平台强制解押（由 Distributor 执行）
 
 适用场景：到期回收、司法要求、合规需要。
 
@@ -447,9 +465,9 @@ unstakeBatchPlatform([tokenId1, tokenId2, tokenId3])
 | `SalesRatioUpdatePaused` | `admin(indexed)` | 暂停销售比例更新 |
 | `SalesRatioUpdateResumed` | `admin(indexed)` | 恢复销售比例更新 |
 | `AdditionalRewardAdded` | `admin(indexed), amount` | 注入额外奖励 |
+| `DistributorSet` | `admin(indexed), newDistributor` | 设置分发操作员 |
 | `ERC20Rescued` | `operator(indexed), token, amount` | 救援 ERC20 |
 | `ERC721Rescued` | `operator(indexed), nft, tokenId` | 救援 ERC721 |
-| `GASRescued` | `operator(indexed), amount` | 救援主网币 |
 
 ---
 
@@ -469,11 +487,11 @@ unstakeBatchPlatform([tokenId1, tokenId2, tokenId3])
 | `NoClaimable` | 无可领取的奖励 |
 | `AmountZero` | 金额为 0 |
 | `AmountExceedsPending` | 提现金额超过可领取奖励 |
-| `InsufficientBalance` | 合约主网币余额不足 |
+| `NotDistributor` | 调用者不是分发操作员 |
+| `UnsolicitedNFTTransfer` | 未通过 stake 流程直接向合约发送 Prompt NFT |
 | `LengthMismatch` | 批量操作的数组长度不一致 |
 | `CannotRescuePTC` | 不允许救援 PTC 代币 |
 | `CannotRescueStakedNFT` | 不允许救援 Prompt NFT |
-| `TransferFailed` | 主网币转账失败 |
 | `NoPendingWithdrawal` | 没有待处理的缓冲池提现请求 |
 | `WithdrawalDelayNotMet` | 缓冲池提现延迟未满 |
 | `BufferPoolNotSet` | 缓冲池地址未设置 |
@@ -559,17 +577,23 @@ emittedUntil(startRewardTimestamp + 2555 days) = 2,775,000,000 ether (第7年末
 2. 调用 `pause()` 暂停合约
 3. 评估影响后决定后续操作
 
-### 9.3 Owner 私钥泄露
+### 9.3 Distributor 私钥泄露
+
+1. Owner 立即调用 `setDistributor(newDistributorAddress)` 更换分发操作员
+2. 检查是否有异常提现或代扣操作（监控 `Claimed`、`PlatformCharged` 事件）
+3. 如情况严重，调用 `pause()` 暂停合约
+
+### 9.4 Owner 私钥泄露
 
 1. 立即通过多签发起 `transferOwnership()` 转移至新的多签钱包
 2. 检查是否有异常操作（监控事件日志）
 
-### 9.4 PTC 余额即将不足
+### 9.5 PTC 余额即将不足
 
 1. 向合约地址转入更多 PTC
 2. 临时暂停批量提现，优先保障单笔提现
 
-### 9.5 用户 NFT 无法取回（gas 不足）
+### 9.6 用户 NFT 无法取回（gas 不足）
 
 如果用户质押了过多 NFT 导致 `unstakeAll` gas 超限：
 - 使用 `unstakeBatch` 分批解押
@@ -579,17 +603,26 @@ emittedUntil(startRewardTimestamp + 2555 days) = 2,775,000,000 ether (第7年末
 
 ## 10. 安全注意事项
 
-### 10.1 Owner 权限
+### 10.1 权限分离架构
 
-Owner 拥有以下重要权限，必须通过多签钱包管控：
+合约采用 Owner / Distributor 权限分离设计：
 
-- 为用户提现（可设置任意手续费率，最高 100%）
-- 将用户的待领取奖励代扣至平台收款账户（无手续费，用于平台消费场景）
+**Owner（管理角色，建议多签钱包）**：
+
 - 暂停/恢复合约
+- 修改手续费接收地址、缓冲池地址、平台代扣款收款账户、分发操作员地址
+- 提取缓冲池资金（含时间锁）
+- 救援合约内的误转 ERC20/ERC721 代币
+- 注入额外奖励（第 6 年后）
+- 暂停/恢复销售比例更新
+
+**Distributor（分发角色，可用热钱包）**：
+
+- 为用户提现（可设置手续费率，最高 100%）
+- 将用户的待领取奖励代扣至平台收款账户（无手续费）
 - 强制解押用户的 NFT
-- 提取缓冲池资金
-- 修改手续费接收地址、缓冲池地址、平台代扣款收款账户
-- 救援合约内的其他代币/ETH
+
+**安全优势**：即使 Distributor 私钥泄露，攻击者无法暂停合约、修改参数、救援资产或转移 Owner。Owner 可通过 `setDistributor()` 立即更换受损的 Distributor 地址。
 
 **强烈建议**：部署后立即将 Owner 转移至 Gnosis Safe 多签钱包（至少 3/5）。
 
@@ -603,9 +636,14 @@ Owner 拥有以下重要权限，必须通过多签钱包管控：
 
 - `rescueERC20` 禁止救援 PTC 代币，防止管理员挪用质押奖励
 - `rescueERC721` 禁止救援 Prompt NFT 合约的任何 NFT
+- 合约拒绝未通过 `stake()` 流程直接发送的 Prompt NFT（`onERC721Received` 检查 `operator`），防止资产锁死
 - 缓冲池提现有 1 天时间锁保护
 
-### 10.4 批量操作 gas 管理
+### 10.4 集成方注意事项（批量解押中间状态）
+
+在 `unstakeBatch` / `unstakeAll` 执行期间，ERC-721 `safeTransferFrom` 的 receiver hook 可能触发回调。在回调中对 PromptStaking 进行 `view` 查询（如 `claimable()`）会观察到**中间状态**：部分 NFT 已解押完成、其余尚在循环中。`nonReentrant` 保证合约自身状态安全，但集成方应**避免在 `onERC721Received` 回调中依赖 PromptStaking 的 view 返回值**，建议在交易完成后再查询。
+
+### 10.5 批量操作 gas 管理
 
 合约未设置批量操作的硬性数量上限，需在链下管理：
 
