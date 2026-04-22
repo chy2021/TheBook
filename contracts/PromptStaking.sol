@@ -136,9 +136,9 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     // -------------------- 缓冲池提现延迟参数 --------------------
     uint256 public constant BUFFER_WITHDRAWAL_DELAY = 1 days; // 缓冲池提取延迟时间
 
-    // -------------------- 销售比例参数 --------------------
-    uint256 public salesRatio; // 销售比例（1e18精度），由owner通过updateSalesRatio设置
-    uint256 public constant MAX_SALES_RATIO = 1e18; // 销售比例上限 100%
+    // -------------------- 销售比例保护参数 --------------------
+    uint256 private lastSalesRatioUpdate;
+    uint256 private cachedSalesRatio;
 
     // -------------------- 权限修饰符 --------------------
     modifier onlyDistributor() {
