@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // PromptStaking.sol
 // NFT质押合约 V4.0
-//
+
 // 支持1种NFT（Prompt），按权重分配PTC奖励。
 // 质押挖矿的总数量：30亿
-// 释放规则：第一年18%，第二年16%，第三年14%，第四年12%，第五年10%，从第六年开始把剩余数量按照每年释放50%逐年减半的逻辑释放。
-// 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。
+// 释放规则：第一年18%，第二年16%，第三年14%，第四年12%，第五年10%，从第六年开始把剩余数量（30%）和提前注入的数量按照每年释放50%逐年减半的逻辑释放。
+// 奖励计算：每次计算时使用当前基数乘以（已销售NFT数量/NFT发行总数）的比例，已销售数量 = NFT发行总数 - 销售地址持有量。未销售数量对应的比例进入缓冲池，缓冲池中部分数量将在第六年开始前注入至合约，参与第六年之后的按年减半释放。
 // 奖励分配：用户收益 = 总释放奖励 × 销售比例，剩余部分进入缓冲池。
 // 提现：分发操作员（distributor）控制，支持随时为用户提现全部奖励。
 // 平台代扣：分发操作员可将单个或多个用户的待领取奖励直接划转至预先配置的平台收款账户，无手续费。
@@ -52,7 +52,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
     error WithdrawalDelayNotMet();
     error BufferPoolNotSet();
     error InsufficientBufferPool();
-    error TooEarlyForAdditional();
+    error TooLateForAdditional();
     error PlatformReceiverNotSet();
     error EmptyUserList();
     error NotDistributor();
@@ -89,16 +89,10 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
 
     uint256 public constant REMAINING_AFTER_5_YEARS = 900000000 ether; // 前5年释放21亿，剩余9亿用于第6年后动态释放
     uint256 public constant FRACTION = 5000; // 50% = 5000/10000，保持不变，第六年开始每年释放年初剩余的50%
-    uint256 public constant MAX_DYNAMIC_YEARS = 100; // 第6年后动态释放的最大年数上限，防止循环耗尽gas
+    uint256 public constant MAX_DYNAMIC_YEARS = 64; // 第6年后动态释放的最大年数上限，防止循环耗尽gas
     uint256 public constant MAX_FEE_RATE = 10000; // 手续费率上限 100%
-
-    // 第6年后的额外注入奖励（按注入时间前向生效，不回溯历史区间）
-    struct AdditionalInjection {
-        uint256 amount;     // 注入金额
-        uint256 fromYear;   // 生效起始年索引（相对于start6，0=第6年，1=第7年...）
-    }
-    AdditionalInjection[] public additionalInjections;
-    uint256 public totalAdditionalReward; // 累计注入总量（便于查询）
+    
+    uint256 public totalAdditionalReward; // 累计额外注入总量
 
     // 释放周期：前5年固定，第6年开始动态释放
     uint256 public constant SCHEDULE_PERIOD_DURATION = 365 days;
@@ -386,49 +380,39 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
             uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
             total += schedulePeriodTotals[i] * elapsed / periodDuration;
         }
-        // 从第六年开始动态释放（基础9亿 + 各笔注入按各自生效年份前向释放）
+        // 从第六年开始动态释放（基础+额外注入）
         uint256 start6 = startRewardTimestamp + 5 * periodDuration;
         if (t > start6) {
-            total += _emittedTail(t, start6, periodDuration, REMAINING_AFTER_5_YEARS, 0);
-            uint256 injLen = additionalInjections.length;
-            for (uint256 j = 0; j < injLen; j++) {
-                AdditionalInjection storage inj = additionalInjections[j];
-                total += _emittedTail(t, start6, periodDuration, inj.amount, inj.fromYear);
-            }
+           uint256 totalRemaining = REMAINING_AFTER_5_YEARS + totalAdditionalReward;
+           total += _emittedTail(t, start6, periodDuration, totalRemaining);
         }
         return total;
     }
 
-    /// @dev 计算单笔资金池从 fromYear 开始按50%减半释放到时间 t 的累计释放量
+    /// @dev 计算单笔资金池从第六年开始按50%减半释放到时间 t 的累计释放量
     /// @param t 目标时间
     /// @param start6 第6年起始时间戳
     /// @param periodDuration 每年时长
     /// @param initialRemaining 该笔资金池初始总量
-    /// @param fromYear 该笔资金开始参与释放的年索引（0=第6年）
     function _emittedTail(
         uint256 t,
         uint256 start6,
         uint256 periodDuration,
-        uint256 initialRemaining,
-        uint256 fromYear
+        uint256 initialRemaining
     ) internal pure returns (uint256) {
+        if (t <= start6 || initialRemaining == 0) {
+            return 0;
+        }
         uint256 yearsPassed = (t - start6) / periodDuration;
         uint256 maxYears = yearsPassed < MAX_DYNAMIC_YEARS ? yearsPassed : MAX_DYNAMIC_YEARS;
-        if (maxYears < fromYear) return 0;
 
         uint256 remaining = initialRemaining;
-        for (uint256 y = 0; y < fromYear && remaining > 0; y++) {
-            uint256 dec = remaining * FRACTION / 10000;
-            if (dec == 0) break;
-            remaining -= dec;
-        }
-
         uint256 emitted = 0;
-        for (uint256 y = fromYear; y <= maxYears && remaining > 0; y++) {
+
+        for (uint256 y = 0; y <= maxYears && remaining > 0; y++) {
             uint256 releaseThisYear = remaining * FRACTION / 10000;
             if (releaseThisYear == 0) break;
             uint256 periodStart = start6 + y * periodDuration;
-            if (t <= periodStart) break;
             uint256 periodEnd = periodStart + periodDuration;
             uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
             emitted += releaseThisYear * elapsed / periodDuration;
@@ -889,26 +873,17 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
         emit BufferPoolWithdrawn(msg.sender, amount);
     }
 
-    /// @notice 管理员注入额外奖励（第6年后的减半发放总量，仅从下一个完整年度开始前向释放，不回溯历史）
+    /// @notice 管理员注入额外奖励（第6年开始前可注入，第6年开始后不可注入。）
     /// @param amount 注入的PTC金额
     function addAdditionalReward(uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert AmountZero();
         uint256 start6 = startRewardTimestamp + 5 * SCHEDULE_PERIOD_DURATION;
-        if (block.timestamp < start6) revert TooEarlyForAdditional();
+        if (block.timestamp > start6) revert TooLateForAdditional();
         _updateGlobal();
-        uint256 fromYear = (block.timestamp - start6) / SCHEDULE_PERIOD_DURATION + 1;
-        additionalInjections.push(AdditionalInjection({
-            amount: amount,
-            fromYear: fromYear
-        }));
+        
         totalAdditionalReward += amount;
         ptc.safeTransferFrom(msg.sender, address(this), amount);
         emit AdditionalRewardAdded(msg.sender, amount);
-    }
-
-    /// @notice 查询额外注入记录数量
-    function getAdditionalInjectionsCount() external view returns (uint256) {
-        return additionalInjections.length;
     }
 
     /// @notice ERC721接收回调：promptNFT仅允许合约自身发起的转入（即通过stake流程），其他NFT无条件接受
