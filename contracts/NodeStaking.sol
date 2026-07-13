@@ -71,6 +71,14 @@ contract NodeStaking is Ownable, ReentrancyGuard, IERC721Receiver {
         emit WhitelistSet(tokenId, enabled);
     }
 
+    function setWhitelistedTokenIds(uint256[] calldata tokenIds, bool enabled) external onlyOwner {
+        if (tokenIds.length == 0) revert NoTokenIds();
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            whitelistedTokenIds[tokenIds[i]] = enabled;
+            emit WhitelistSet(tokenIds[i], enabled);
+        }
+    }
+
     // 动态更新 Vault 地址，便于后续切换或升级
     function setVault(address _vault) external onlyOwner {
         if (_vault == address(0)) revert ZeroAddress();
